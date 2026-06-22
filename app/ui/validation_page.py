@@ -19,6 +19,7 @@ class ValidationPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.current_items: List[PriceItem] = []
+        self._active_workbench_filter: str = "all"
         self._init_ui()
 
     def _init_ui(self):
@@ -26,12 +27,16 @@ class ValidationPage(QWidget):
         layout.setContentsMargins(25, 20, 25, 20)
         layout.setSpacing(15)
 
-        title = QLabel("价格校验")
+        title = QLabel("价格校验 · 批量处理工作台")
         title.setObjectName("PageTitle")
         layout.addWidget(title)
 
-        subtitle = QLabel("检查会员价合理性、成本价限制，快速定位和修复价格问题")
+        subtitle = QLabel(
+            "点击下方卡片快速筛选问题类别，按「一键修复」批量处理。"
+            "每修完一类，卡片数字会实时减少，直到全部变绿。"
+        )
         subtitle.setObjectName("PageSubtitle")
+        subtitle.setWordWrap(True)
         layout.addWidget(subtitle)
 
         stats_row = QHBoxLayout()
@@ -39,18 +44,34 @@ class ValidationPage(QWidget):
         self.stat_cost = StatCard("低于成本价", "0", "#f59e0b")
         self.stat_dup = StatCard("重名项目", "0", "#8b5cf6")
         self.stat_ok = StatCard("正常项目", "0", "#10b981")
+        # 让每个 StatCard 本身也变成可点击的筛选入口
+        for w in (self.stat_member, self.stat_cost, self.stat_dup, self.stat_ok):
+            w.setCursor(Qt.PointingHandCursor)
+        self.stat_member.mousePressEvent = lambda ev: self._workbench_select("member")
+        self.stat_cost.mousePressEvent = lambda ev: self._workbench_select("cost")
+        self.stat_dup.mousePressEvent = lambda ev: self._workbench_select("duplicate")
+        self.stat_ok.mousePressEvent = lambda ev: self._workbench_select("ok")
+
         stats_row.addWidget(self.stat_member)
         stats_row.addWidget(self.stat_cost)
         stats_row.addWidget(self.stat_dup)
         stats_row.addWidget(self.stat_ok)
         layout.addLayout(stats_row)
 
+        # 工作台状态提示：当前筛选类别 + 剩余未修数量
+        self.workbench_status = QLabel("当前显示：全部项目")
+        self.workbench_status.setStyleSheet(
+            "padding: 8px 14px; background: #f1f5f9; color: #334155;"
+            " border-radius: 6px; font-weight: 500;"
+        )
+        layout.addWidget(self.workbench_status)
+
         filter_card = QFrame()
         filter_card.setObjectName("Card")
         filter_layout = QHBoxLayout(filter_card)
         filter_layout.setContentsMargins(15, 12, 15, 12)
 
-        filter_layout.addWidget(QLabel("筛选："))
+        filter_layout.addWidget(QLabel("高级筛选："))
 
         self.filter_issue = QComboBox()
         self.filter_issue.addItem("全部项目", "all")
@@ -58,6 +79,7 @@ class ValidationPage(QWidget):
         self.filter_issue.addItem("低于成本价", "cost")
         self.filter_issue.addItem("重名项目", "duplicate")
         self.filter_issue.addItem("仅显示有问题", "error")
+        self.filter_issue.addItem("仅显示正常", "ok")
         filter_layout.addWidget(self.filter_issue)
 
         self.filter_category = QComboBox()
@@ -132,7 +154,7 @@ class ValidationPage(QWidget):
 
         layout.addWidget(splitter, 1)
 
-        self.filter_issue.currentIndexChanged.connect(self._refresh_table)
+        self.filter_issue.currentIndexChanged.connect(self._on_filter_issue_changed)
         self.filter_category.currentIndexChanged.connect(self._refresh_table)
         self.search_edit.textChanged.connect(self._refresh_table)
         self.btn_validate.clicked.connect(self.run_validation)
@@ -143,11 +165,20 @@ class ValidationPage(QWidget):
         self.table.itemSelectionChanged.connect(self._show_issues)
 
         self._original_snapshot = []
+        self._highlight_selected_card("all")
 
     def set_items(self, items: List[PriceItem]):
         self.current_items = items
         self._original_snapshot = [PriceItem(**{k: getattr(it, k) for k in PriceItem.__dataclass_fields__}) for it in items]
         self.run_validation()
+
+    def _on_filter_issue_changed(self, _idx: int = 0):
+        """下拉筛选切换时同步工作台高亮和状态提示"""
+        data = self.filter_issue.currentData()
+        self._active_workbench_filter = data if data else "all"
+        self._highlight_selected_card(self._active_workbench_filter)
+        self._update_workbench_status(self._active_workbench_filter)
+        self._refresh_table()
 
     def run_validation(self):
         self.table.blockSignals(True)
@@ -168,6 +199,9 @@ class ValidationPage(QWidget):
             [x.id for grp in duplicates.values() for x in grp]
         ))
         self.stat_ok.update_value(str(max(0, ok_count)))
+
+        # 刷新工作台状态提示
+        self._update_workbench_status(self._active_workbench_filter)
 
         self._refresh_table()
         self.table.blockSignals(False)
@@ -220,6 +254,8 @@ class ValidationPage(QWidget):
             elif issue_filter == "duplicate" and item.id not in dup_ids:
                 continue
             elif issue_filter == "error" and not has_error:
+                continue
+            elif issue_filter == "ok" and has_error:
                 continue
 
             filtered.append((item, issues, member_ids, cost_ids, dup_ids))
@@ -447,3 +483,72 @@ class ValidationPage(QWidget):
         self.current_items = [PriceItem(**{k: getattr(it, k) for k in PriceItem.__dataclass_fields__}) for it in self._original_snapshot]
         self.run_validation()
         QMessageBox.information(self, "已撤销", "已恢复到上次保存状态")
+
+    # ---------- 工作台（批量处理）辅助方法 ----------
+    def _workbench_select(self, filter_key: str):
+        """点击顶部问题卡片触发：同步切换下拉筛选 + 高亮卡片 + 更新状态提示"""
+        self._active_workbench_filter = filter_key
+        # 同步到下拉框
+        for i in range(self.filter_issue.count()):
+            if self.filter_issue.itemData(i) == filter_key:
+                self.filter_issue.setCurrentIndex(i)
+                break
+        self._highlight_selected_card(filter_key)
+        self._update_workbench_status(filter_key)
+
+    def _highlight_selected_card(self, filter_key: str):
+        """给选中的问题类型卡片加一个显眼的边框/背景"""
+        base_style = "#Card { border: 2px solid transparent; border-radius: 10px; }"
+        active_style_map = {
+            "member": "#Card { border: 2px solid #ef4444; border-radius: 10px; background: #fef2f2; }",
+            "cost": "#Card { border: 2px solid #f59e0b; border-radius: 10px; background: #fffbeb; }",
+            "duplicate": "#Card { border: 2px solid #8b5cf6; border-radius: 10px; background: #f5f3ff; }",
+            "ok": "#Card { border: 2px solid #10b981; border-radius: 10px; background: #ecfdf5; }",
+        }
+        all_cards = [
+            ("member", self.stat_member),
+            ("cost", self.stat_cost),
+            ("duplicate", self.stat_dup),
+            ("ok", self.stat_ok),
+        ]
+        for key, card in all_cards:
+            card.setStyleSheet(active_style_map.get(key, base_style) if key == filter_key else base_style)
+
+    def _update_workbench_status(self, filter_key: str):
+        """根据当前筛选类别更新工作台状态提示文案"""
+        label_map = {
+            "all": "全部项目",
+            "member": "会员价高于原价（点击卡片旁的「一键修复会员价」可批量处理）",
+            "cost": "低于成本价（点击卡片旁的「一键修复成本价」可批量处理）",
+            "duplicate": "同名不同价（需要手动或批量合并冲突项目）",
+            "error": "所有有问题的项目",
+            "ok": "正常项目",
+        }
+        # 取对应问题的剩余数量
+        if not hasattr(self, "validations"):
+            remaining = len(self.current_items)
+        else:
+            if filter_key == "member":
+                remaining = len(set(x[0].id for x in self.validations.get("member_above_original", [])))
+            elif filter_key == "cost":
+                remaining = len(set(x[0].id for x in self.validations.get("below_cost", [])))
+            elif filter_key == "duplicate":
+                remaining = sum(len(g) for g in self.validations.get("duplicate_names", {}).values())
+            elif filter_key == "ok":
+                remaining = int(self.stat_ok.value_label.text() or "0")
+            elif filter_key == "error":
+                problem_ids = set()
+                for it, _ in self.validations.get("member_above_original", []):
+                    problem_ids.add(it.id)
+                for it, _ in self.validations.get("below_cost", []):
+                    problem_ids.add(it.id)
+                for grp in self.validations.get("duplicate_names", {}).values():
+                    for it in grp:
+                        problem_ids.add(it.id)
+                remaining = len(problem_ids)
+            else:
+                remaining = len(self.current_items)
+        text = f"当前显示：{label_map.get(filter_key, '全部项目')}  |  匹配 {remaining} 条"
+        if filter_key in ("member", "cost", "duplicate") and remaining == 0:
+            text += "  ✅ 此类问题已全部解决！"
+        self.workbench_status.setText(text)

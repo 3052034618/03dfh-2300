@@ -124,13 +124,7 @@ class PrintPage(QWidget):
         btn_row = QHBoxLayout()
         self.btn_preview = QPushButton("🔍 预览PDF")
         self.btn_preview.setObjectName("PrimaryButton")
-        if self._pdf_generator is None:
-            self.btn_preview.setEnabled(False)
-            self.btn_preview.setToolTip("PDF生成组件不可用")
         self.btn_print = QPushButton("🖨️ 打印")
-        if not _has_os_startfile():
-            self.btn_print.setEnabled(False)
-            self.btn_print.setToolTip("当前系统不支持直接打印")
         btn_row.addWidget(self.btn_preview)
         btn_row.addWidget(self.btn_print)
         s_layout.addLayout(btn_row)
@@ -139,9 +133,6 @@ class PrintPage(QWidget):
         export_layout = QGridLayout(export_group)
         self.btn_export_pdf = QPushButton("导出 PDF")
         self.btn_export_pdf.setObjectName("PrimaryButton")
-        if self._pdf_generator is None:
-            self.btn_export_pdf.setEnabled(False)
-            self.btn_export_pdf.setToolTip("PDF生成组件不可用")
         self.btn_export_excel = QPushButton("导出 Excel 完整版")
         self.btn_export_simple = QPushButton("导出 Excel 精简版")
         self.btn_export_csv = QPushButton("导出咨询师 CSV")
@@ -296,10 +287,17 @@ class PrintPage(QWidget):
     def _prepare_temp_pdf(self) -> str:
         if self._pdf_generator is None:
             QMessageBox.warning(
-                self, "功能不可用",
-                "PDF生成组件不可用（缺少 reportlab 或字体异常）。\n\n"
-                "请先执行：pip install reportlab\n\n"
-                "或使用「导出 Excel」功能代替。"
+                self, "PDF 功能暂不可用",
+                "当前电脑缺少 PDF 生成相关能力，原因可能是：\n\n"
+                "  1. 未安装 reportlab 库\n"
+                "  2. 系统缺少中文字体（微软雅黑/宋体）\n\n"
+                "✅ 修复步骤：\n"
+                "  在命令行运行：pip install reportlab\n\n"
+                "💡 当前可用的替代方案：\n"
+                "  • 导出 Excel 完整版（含所有价格字段）\n"
+                "  • 导出 Excel 精简版（客户展示用）\n"
+                "  • 导出咨询师 CSV（底价+成本）\n\n"
+                "以上三种导出入口始终可用，不受 PDF 能力影响。"
             )
             return ""
 
@@ -375,16 +373,20 @@ class PrintPage(QWidget):
             )
 
     def _do_print(self):
-        pdf_path = self._prepare_temp_pdf()
-        if not pdf_path:
-            return
-
         if not _has_os_startfile():
             QMessageBox.warning(
-                self, "打印不可用",
-                "当前系统不支持直接发送打印命令。\n\n"
-                f"请手动打开 PDF 文件后打印：\n{pdf_path}"
+                self, "直接打印不可用",
+                "当前系统不支持直接发送打印命令（非 Windows 或缺少默认 PDF 阅读器）。\n\n"
+                "💡 替代方案：\n"
+                "  1. 使用「导出 Excel 完整版」，在 Excel 中按 Ctrl+P 打印\n"
+                "  2. 使用「导出 Excel 精简版」，适合打印给客户的价目表\n"
+                "  3. 使用「导出咨询师 CSV」，打印内部核算版\n\n"
+                "以上三种导出入口始终可用。"
             )
+            return
+
+        pdf_path = self._prepare_temp_pdf()
+        if not pdf_path:
             return
 
         try:
@@ -405,8 +407,13 @@ class PrintPage(QWidget):
     def _export_pdf(self):
         if self._pdf_generator is None:
             QMessageBox.warning(
-                self, "功能不可用",
-                "PDF生成组件不可用。\n\n请使用 Excel 导出功能。"
+                self, "PDF 导出暂不可用",
+                "当前电脑缺少 PDF 生成相关能力（reportlab 或字体异常）。\n\n"
+                "✅ 修复：pip install reportlab\n\n"
+                "💡 替代方案（始终可用）：\n"
+                "  • 导出 Excel 完整版\n"
+                "  • 导出 Excel 精简版\n"
+                "  • 导出咨询师 CSV"
             )
             return
 

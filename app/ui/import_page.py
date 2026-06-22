@@ -1,9 +1,9 @@
-from typing import List
+from typing import List, Dict, Any
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QMessageBox,
     QDialog, QDialogButtonBox, QComboBox, QRadioButton, QButtonGroup,
-    QFrame, QFileDialog, QScrollArea, QCheckBox
+    QFrame, QFileDialog, QScrollArea, QCheckBox, QGridLayout, QGroupBox
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QBrush, QFont
@@ -12,6 +12,129 @@ from .widgets import DropZone, StatCard
 from ..core.models import PriceItem
 from ..core.data_manager import ExcelImporter
 from ..core.price_engine import PriceValidator, ConflictResolver
+
+
+FIELD_LABELS = [
+    ("name", "项目名称（必填）", True),
+    ("display_name", "前台展示名", False),
+    ("internal_name", "内部核算名", False),
+    ("category", "分类", False),
+    ("original_price", "原价（必填）", True),
+    ("member_price", "会员价", False),
+    ("doctor_fee", "医生费", False),
+    ("material_fee", "耗材费", False),
+    ("material_brand", "耗材品牌", False),
+    ("cost_price", "成本价", False),
+    ("remark", "备注", False),
+]
+
+
+class FieldMappingDialog(QDialog):
+    """字段映射确认对话框：让用户手动匹配 Excel 列与价目表字段"""
+    mappingConfirmed = Signal(dict)
+
+    def __init__(self, headers: List[str], preview_rows: List[List[str]],
+                 auto_mapping: Dict[str, int], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("字段映射确认 - 请核对 Excel 列对应关系")
+        self.setMinimumSize(820, 600)
+        self.headers = headers
+        self.preview_rows = preview_rows
+        self._combo_map: Dict[str, QComboBox] = {}
+
+        layout = QVBoxLayout(self)
+
+        tip = QLabel(
+            "系统已按列名做了自动匹配，请<b style='color:#1e40af'>请核对下表，若有误请手动修改。"
+            "确认无误后点击「确认导入」继续。"
+        )
+        tip.setStyleSheet(
+            "padding: 10px 14px; background: #eff6ff; color: #1e3a8a;"
+            " border-radius: 6px;"
+        )
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+
+        # --- 预览表（显示表头与前几行，让运营直观判断
+        preview_group = QGroupBox("📋 Excel 内容预览（前几行）")
+        pv_layout = QVBoxLayout(preview_group)
+        self.preview_table = QTableWidget()
+        self.preview_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.preview_table.setAlternatingRowColors(True)
+        self.preview_table.verticalHeader().setVisible(False)
+        pv_layout.addWidget(self.preview_table)
+        preview_group.setMaximumHeight(200)
+        layout.addWidget(preview_group)
+
+        # --- 字段映射区
+        map_group = QGroupBox("🔗 字段映射（左侧是价目表字段 → 右侧选择 Excel 列）")
+        map_layout = QGridLayout(map_group)
+        map_layout.addWidget(QLabel("<b>价目表字段</b>"), 0, 0)
+        map_layout.addWidget(QLabel("<b>对应 Excel 列</b>"), 0, 1)
+        options = ["（不导入该字段）"] + headers
+        for row, (field_key, field_label, required) in enumerate(FIELD_LABELS, start=1):
+            if required:
+                lbl_text = f"{field_label}  <span style='color:#dc2626'>*必填</span>"
+            else:
+                lbl_text = field_label
+            lbl = QLabel(lbl_text)
+            lbl.setStyleSheet("padding: 4px 0;")
+            map_layout.addWidget(lbl, row, 0)
+            combo = QComboBox()
+            combo.addItems(options)
+            # 自动匹配值
+            default_idx = 0
+            if field_key in auto_mapping and auto_mapping[field_key] < len(headers):
+                default_idx = auto_mapping[field_key] + 1  # +1 因为第一个是"不导入"
+            if default_idx >= combo.count():
+                default_idx = 0
+            combo.setCurrentIndex(default_idx)
+            self._combo_map[field_key] = combo
+            map_layout.addWidget(combo, row, 1)
+        layout.addWidget(map_group, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("✓ 确认导入")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons.accepted.connect(self._on_confirm)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._fill_preview()
+
+    def _fill_preview(self):
+        self.preview_table.setColumnCount(len(self.headers))
+        self.preview_table.setHorizontalHeaderLabels(self.headers)
+        self.preview_table.setRowCount(len(self.preview_rows))
+        for r, row in enumerate(self.preview_rows):
+            for c, val in enumerate(row):
+                if c >= len(self.headers):
+                    break
+                cell = QTableWidgetItem(str(val))
+                self.preview_table.setItem(r, c, cell)
+        for col in range(len(self.headers)):
+            self.preview_table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeToContents)
+
+    def _on_confirm(self):
+        mapping: Dict[str, int] = {}
+        for field_key, combo in self._combo_map.items():
+            idx = combo.currentIndex()
+            if idx > 0:
+                mapping[field_key] = idx - 1
+        # 校验必填
+        missing = []
+        for field_key, label, required in FIELD_LABELS:
+            if required and field_key not in mapping:
+                missing.append(label)
+        if missing:
+            QMessageBox.warning(
+                self, "缺少必填字段",
+                "以下必填字段未匹配 Excel 列：\n\n  • " + "\n  • ".join(missing) +
+                "\n\n请至少为必填字段选择对应的 Excel 列。"
+            )
+            return
+        self.mappingConfirmed.emit(mapping)
+        self.accept()
 
 
 class ConflictResolveDialog(QDialog):
@@ -206,23 +329,37 @@ class ImportPage(QWidget):
         self.btn_confirm.clicked.connect(self._confirm_import)
 
     def _on_file_import(self, file_path: str):
-        items, warnings = ExcelImporter.import_file(file_path)
+        # 第一步：只读表头+前几行，用于字段映射确认
+        headers, preview_rows, warnings = ExcelImporter.inspect_file(file_path)
+        if not headers:
+            QMessageBox.critical(self, "导入失败", "\n".join(warnings) if warnings else "无法读取文件表头")
+            return
+
+        # 自动匹配默认 mapping
+        auto_mapping = ExcelImporter._map_columns(headers)
+
+        # 第二步：弹字段映射确认对话框
+        dlg = FieldMappingDialog(headers, preview_rows, auto_mapping, self)
+        confirmed_mapping = {}
+        dlg.mappingConfirmed.connect(lambda m: confirmed_mapping.update(m))
+        if dlg.exec() != QDialog.Accepted or not confirmed_mapping:
+            return  # 用户取消
+
+        # 第三步：按确认后的 mapping 正式导入
+        items, import_warnings = ExcelImporter.import_file(file_path, col_mapping=confirmed_mapping)
         if not items:
-            QMessageBox.critical(self, "导入失败", "\n".join(warnings) if warnings else "未识别到有效数据")
+            QMessageBox.critical(self, "导入失败", "\n".join(import_warnings) if import_warnings else "未识别到有效数据")
             return
 
         self.current_items = items
 
-        if warnings:
-            QMessageBox.warning(self, "导入提示", "\n".join(warnings))
+        all_warnings = warnings + import_warnings
+        if all_warnings:
+            QMessageBox.warning(self, "导入提示", "\n".join(all_warnings))
 
         validations = PriceValidator.run_all_validations(items)
         conflicts = validations["price_conflicts"]
         errors = validations["all_errors"]
-
-        for item in items:
-            if item.is_conflict:
-                item.is_conflict = True
 
         categories = set(it.category for it in items)
 
@@ -234,7 +371,8 @@ class ImportPage(QWidget):
         self._refresh_preview_table()
         self.preview_card.setVisible(True)
 
-        self.drop_zone.text_label.setText(f"已导入: {file_path.split('/')[-1]}")
+        filename = file_path.replace("\\", "/").split("/")[-1]
+        self.drop_zone.text_label.setText(f"已导入: {filename}")
 
     def _refresh_preview_table(self):
         headers = ["状态", "项目名称", "前台展示名", "分类", "原价", "会员价",

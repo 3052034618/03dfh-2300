@@ -5,7 +5,8 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QMessageBox,
     QFrame, QLineEdit, QTextEdit, QSplitter, QFileDialog, QInputDialog,
-    QListWidget, QListWidgetItem, QMenu, QProgressBar
+    QListWidget, QListWidgetItem, QMenu, QProgressBar, QDialog, QDialogButtonBox,
+    QComboBox, QCheckBox
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QBrush, QFont, QAction
@@ -15,8 +16,288 @@ from ..core.models import PriceItem, Snapshot
 from ..core.data_manager import BackupManager
 
 
+COMPARE_PRICE_FIELDS = [
+    ("original_price", "原价"),
+    ("member_price", "会员价"),
+    ("doctor_fee", "医生费"),
+    ("material_fee", "耗材费"),
+    ("cost_price", "成本价"),
+]
+
+
+def compare_two_snapshots(old_items: List[PriceItem],
+                          new_items: List[PriceItem]) -> List[Dict[str, Any]]:
+    """对比两个快照（以项目名称为 key），返回差异列表。
+    每个元素:
+      {"type": "added",   "item": new_item}
+      {"type": "removed", "item": old_item}
+      {"type": "modified","old_item": old, "new_item": new, "changes": [(label, ov, nv), ...]}
+    """
+    old_by_name = {it.name: it for it in old_items if it.name}
+    new_by_name = {it.name: it for it in new_items if it.name}
+    diffs: List[Dict[str, Any]] = []
+
+    for name, new_it in new_by_name.items():
+        if name not in old_by_name:
+            diffs.append({"type": "added", "item": new_it})
+            continue
+        old_it = old_by_name[name]
+        changed_fields: List = []
+        for field, label in COMPARE_PRICE_FIELDS:
+            ov = float(getattr(old_it, field, 0.0) or 0.0)
+            nv = float(getattr(new_it, field, 0.0) or 0.0)
+            if abs(ov - nv) > 0.005:
+                changed_fields.append((label, ov, nv))
+        other_diff = (
+            old_it.category != new_it.category
+            or old_it.display_name != new_it.display_name
+            or old_it.internal_name != new_it.internal_name
+            or old_it.remark != new_it.remark
+        )
+        if other_diff:
+            changed_fields.append(("分类/展示/备注", "变更", "变更"))
+        if changed_fields:
+            diffs.append({
+                "type": "modified",
+                "old_item": old_it,
+                "new_item": new_it,
+                "changes": changed_fields,
+            })
+
+    for name, old_it in old_by_name.items():
+        if name not in new_by_name:
+            diffs.append({"type": "removed", "item": old_it})
+
+    return diffs
+
+
+class SnapshotCompareDialog(QDialog):
+    """快照版本对比对话框：选两个快照，查看差异，并支持部分回滚。"""
+
+    partialRollbackRequested = Signal(list)
+
+    def __init__(self, snapshots_meta: List[Dict[str, Any]],
+                 backup_manager: BackupManager, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("快照版本对比 · 差异与部分回滚")
+        self.setMinimumSize(980, 640)
+        self.backup_manager = backup_manager
+        self._snapshots_meta = snapshots_meta
+        self._snap_cache: Dict[str, List[PriceItem]] = {}
+        self._current_diffs: List[Dict[str, Any]] = []
+
+        layout = QVBoxLayout(self)
+
+        tip = QLabel(
+            "选择<b>旧版本</b>和<b>新版本</b>两个快照进行对比。勾选要回滚的变更行后点击「回滚选中项」，"
+            "即可把选中的几条恢复到<b>旧版本</b>中的状态（新增→删除 / 删除→恢复 / 变更→还原旧值）。"
+        )
+        tip.setWordWrap(True)
+        tip.setStyleSheet(
+            "padding: 10px 14px; background: #eff6ff; color: #1e3a8a;"
+            " border-radius: 6px;"
+        )
+        layout.addWidget(tip)
+
+        pick_row = QHBoxLayout()
+        pick_row.addWidget(QLabel("旧版本（回滚到此状态）："))
+        self.cmb_old = QComboBox()
+        pick_row.addWidget(self.cmb_old, 1)
+        pick_row.addSpacing(16)
+        pick_row.addWidget(QLabel("新版本（对比基准）："))
+        self.cmb_new = QComboBox()
+        pick_row.addWidget(self.cmb_new, 1)
+        self.btn_do_compare = QPushButton("🔍 对比差异")
+        self.btn_do_compare.setObjectName("PrimaryButton")
+        pick_row.addWidget(self.btn_do_compare)
+        layout.addLayout(pick_row)
+
+        for meta in snapshots_meta:
+            name = meta.get("name", "未命名快照")
+            created = (meta.get("created_at", "") or "")[:16]
+            cnt = meta.get("item_count", 0)
+            label = f"📌 {name}   ({created})   {cnt}项"
+            self.cmb_old.addItem(label, meta.get("id"))
+            self.cmb_new.addItem(label, meta.get("id"))
+        if len(snapshots_meta) >= 2:
+            self.cmb_new.setCurrentIndex(0)
+            self.cmb_old.setCurrentIndex(min(1, len(snapshots_meta) - 1))
+
+        stats_row = QHBoxLayout()
+        self.stat_added = StatCard("新增项目", "0", "#10b981")
+        self.stat_removed = StatCard("删除项目", "0", "#ef4444")
+        self.stat_modified = StatCard("价格/信息变更", "0", "#f59e0b")
+        stats_row.addWidget(self.stat_added)
+        stats_row.addWidget(self.stat_removed)
+        stats_row.addWidget(self.stat_modified)
+        layout.addLayout(stats_row)
+
+        self.table = QTableWidget()
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        layout.addWidget(self.table, 1)
+
+        btn_row = QHBoxLayout()
+        self.btn_select_all = QPushButton("全选")
+        self.btn_select_none = QPushButton("取消全选")
+        self.btn_rollback_selected = QPushButton("↩️ 回滚选中项")
+        self.btn_rollback_selected.setObjectName("PrimaryButton")
+        btn_row.addWidget(self.btn_select_all)
+        btn_row.addWidget(self.btn_select_none)
+        btn_row.addStretch()
+        btn_row.addWidget(self.btn_rollback_selected)
+        layout.addLayout(btn_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.button(QDialogButtonBox.Close).clicked.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.btn_do_compare.clicked.connect(self._do_compare)
+        self.btn_select_all.clicked.connect(lambda: self._set_all_checks(True))
+        self.btn_select_none.clicked.connect(lambda: self._set_all_checks(False))
+        self.btn_rollback_selected.clicked.connect(self._rollback_selected)
+
+        if len(snapshots_meta) >= 2:
+            self._do_compare()
+
+    def _load_snapshot_items(self, snap_id: str) -> List[PriceItem]:
+        if snap_id not in self._snap_cache:
+            self._snap_cache[snap_id] = self.backup_manager.load_snapshot(snap_id) or []
+        return self._snap_cache[snap_id]
+
+    def _do_compare(self):
+        old_id = self.cmb_old.currentData()
+        new_id = self.cmb_new.currentData()
+        if not old_id or not new_id or old_id == new_id:
+            QMessageBox.warning(self, "提示", "请选择两个不同的快照进行对比")
+            return
+        old_items = self._load_snapshot_items(old_id)
+        new_items = self._load_snapshot_items(new_id)
+        if not old_items and not new_items:
+            QMessageBox.warning(self, "提示", "所选快照无法加载数据")
+            return
+
+        self._current_diffs = compare_two_snapshots(old_items, new_items)
+        self._fill_table(self._current_diffs)
+        self.stat_added.update_value(str(sum(1 for d in self._current_diffs if d["type"] == "added")))
+        self.stat_removed.update_value(str(sum(1 for d in self._current_diffs if d["type"] == "removed")))
+        self.stat_modified.update_value(str(sum(1 for d in self._current_diffs if d["type"] == "modified")))
+
+    def _pick_item(self, d: Dict[str, Any]) -> PriceItem:
+        if d["type"] == "modified":
+            return d["new_item"]
+        return d["item"]
+
+    def _fill_table(self, diffs: List[Dict[str, Any]]):
+        headers = ["选择", "变更类型", "项目名称", "分类",
+                   "旧版本 原价/会员价", "新版本 原价/会员价", "变更详情"]
+        self.table.setColumnCount(len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
+        self.table.setRowCount(len(diffs))
+
+        for row, d in enumerate(diffs):
+            chk = QCheckBox()
+            self.table.setCellWidget(row, 0, chk)
+
+            t = d["type"]
+            if t == "added":
+                type_text = "🟢 新增（回滚=删除）"
+                item = d["item"]
+                category = item.category or "—"
+                old_val = "—"
+                new_val = (f"¥{item.original_price:,.2f} / "
+                           f"¥{item.member_price:,.2f}")
+                detail = "新版本中新增的项目"
+            elif t == "removed":
+                type_text = "🔴 删除（回滚=恢复）"
+                item = d["item"]
+                category = item.category or "—"
+                old_val = (f"¥{item.original_price:,.2f} / "
+                           f"¥{item.member_price:,.2f}")
+                new_val = "—"
+                detail = "新版本中已被删除"
+            else:
+                type_text = "🟡 变更（回滚=还原旧值）"
+                new_item = d["new_item"]
+                old_item = d["old_item"]
+                category = new_item.category or "—"
+                old_val = (f"¥{old_item.original_price:,.2f} / "
+                           f"¥{old_item.member_price:,.2f}")
+                new_val = (f"¥{new_item.original_price:,.2f} / "
+                           f"¥{new_item.member_price:,.2f}")
+                parts = []
+                for label, ov, nv in d.get("changes", []):
+                    if isinstance(ov, float) and isinstance(nv, float):
+                        parts.append(f"{label}: ¥{ov:,.2f} → ¥{nv:,.2f}")
+                    else:
+                        parts.append(f"{label}: 有变化")
+                detail = "；".join(parts) if parts else "未记录"
+
+            ref_item = self._pick_item(d)
+            name = ref_item.name or "（未命名）"
+            for col, text in enumerate([type_text, name, category, old_val, new_val, detail], start=1):
+                cell = QTableWidgetItem(str(text))
+                if col in (4, 5):
+                    cell.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+                if t == "added":
+                    cell.setForeground(QBrush(QColor("#047857")))
+                elif t == "removed":
+                    cell.setForeground(QBrush(QColor("#b91c1c")))
+                else:
+                    cell.setForeground(QBrush(QColor("#b45309")))
+                self.table.setItem(row, col, cell)
+
+        for col in range(len(headers)):
+            self.table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
+
+    def _set_all_checks(self, checked: bool):
+        for row in range(self.table.rowCount()):
+            chk = self.table.cellWidget(row, 0)
+            if isinstance(chk, QCheckBox):
+                chk.setChecked(checked)
+
+    def _rollback_selected(self):
+        if not self._current_diffs:
+            QMessageBox.information(self, "提示", "请先对比两个快照")
+            return
+        selected_diffs: List[Dict[str, Any]] = []
+        for row in range(self.table.rowCount()):
+            chk = self.table.cellWidget(row, 0)
+            if isinstance(chk, QCheckBox) and chk.isChecked():
+                selected_diffs.append(self._current_diffs[row])
+        if not selected_diffs:
+            QMessageBox.information(self, "提示", "请先勾选要回滚的变更行")
+            return
+
+        n_added = sum(1 for d in selected_diffs if d["type"] == "added")
+        n_removed = sum(1 for d in selected_diffs if d["type"] == "removed")
+        n_modified = sum(1 for d in selected_diffs if d["type"] == "modified")
+        summary_parts = []
+        if n_added:
+            summary_parts.append(f"{n_added} 条新增 → 删除")
+        if n_removed:
+            summary_parts.append(f"{n_removed} 条删除 → 恢复")
+        if n_modified:
+            summary_parts.append(f"{n_modified} 条变更 → 还原旧值")
+        reply = QMessageBox.question(
+            self, "确认部分回滚",
+            f"将对当前数据应用 {len(selected_diffs)} 条变更：\n\n  • "
+            + "\n  • ".join(summary_parts)
+            + "\n\n是否继续？（回滚前会自动创建当前版本快照）",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.partialRollbackRequested.emit(selected_diffs)
+        self.accept()
+
+
 class BackupPage(QWidget):
     rollbackRequested = Signal(list)
+    partialRollbackRequested = Signal(list)
 
     def __init__(self, backup_dir: str, parent=None):
         super().__init__(parent)
@@ -34,7 +315,9 @@ class BackupPage(QWidget):
         title.setObjectName("PageTitle")
         layout.addWidget(title)
 
-        subtitle = QLabel("保存每次修改的快照，误操作时一键回滚到任意历史版本")
+        subtitle = QLabel(
+            "保存每次修改的快照，支持整份回滚、两版本对比和部分项目回滚"
+        )
         subtitle.setObjectName("PageSubtitle")
         layout.addWidget(subtitle)
 
@@ -58,11 +341,14 @@ class BackupPage(QWidget):
 
         self.btn_new = QPushButton("📸 立即创建快照")
         self.btn_new.setObjectName("PrimaryButton")
+        self.btn_compare = QPushButton("🆚 版本对比")
+        self.btn_compare.setToolTip("选择两个快照对比差异，只回滚选中的几条")
         self.btn_export = QPushButton("📦 导出备份文件")
         self.btn_import = QPushButton("📥 导入备份文件")
         self.btn_clean = QPushButton("🗑️ 清理旧备份")
 
         a_layout.addWidget(self.btn_new)
+        a_layout.addWidget(self.btn_compare)
         a_layout.addWidget(self.btn_export)
         a_layout.addWidget(self.btn_import)
         a_layout.addStretch()
@@ -160,6 +446,7 @@ class BackupPage(QWidget):
         layout.addWidget(splitter, 1)
 
         self.btn_new.clicked.connect(self._create_new_snapshot)
+        self.btn_compare.clicked.connect(self._open_compare_dialog)
         self.btn_export.clicked.connect(self._export_all)
         self.btn_import.clicked.connect(self._import_backup)
         self.btn_clean.clicked.connect(self._clean_old)
@@ -169,6 +456,80 @@ class BackupPage(QWidget):
         self.btn_export_snap.clicked.connect(self._export_current)
         self.snapshot_list.currentItemChanged.connect(self._on_select_snapshot)
         self.snapshot_list.customContextMenuRequested.connect(self._show_context_menu)
+
+    def _open_compare_dialog(self):
+        if not self._all_snapshots or len(self._all_snapshots) < 2:
+            QMessageBox.information(
+                self, "提示",
+                "至少需要 2 个快照才能做版本对比。\n请先创建至少两个快照。"
+            )
+            return
+        dlg = SnapshotCompareDialog(self._all_snapshots, self.backup_manager, self)
+        dlg.partialRollbackRequested.connect(self._handle_partial_rollback)
+        dlg.exec()
+
+    def _handle_partial_rollback(self, diffs: List[Dict[str, Any]]):
+        """接收对比对话框的部分回滚请求，把 diff 应用到 current_items。
+        规则：
+          added    → 从当前数据中删除该项目（匹配 name）
+          removed  → 把旧版本项目恢复到当前数据
+          modified → 把当前该项目的数值/信息还原为旧版本
+        """
+        if not self.current_items:
+            QMessageBox.warning(self, "提示", "当前没有任何项目数据，无法应用部分回滚")
+            return
+        current_by_name = {it.name: it for it in self.current_items if it.name}
+        applied = 0
+
+        for d in diffs:
+            t = d["type"]
+            if t == "added":
+                name = d["item"].name
+                if name in current_by_name:
+                    self.current_items.remove(current_by_name[name])
+                    del current_by_name[name]
+                    applied += 1
+            elif t == "removed":
+                old_it = d["item"]
+                if old_it.name not in current_by_name:
+                    from dataclasses import replace
+                    restored = replace(old_it)
+                    self.current_items.append(restored)
+                    current_by_name[restored.name] = restored
+                    applied += 1
+            elif t == "modified":
+                old_it = d["old_item"]
+                target = current_by_name.get(old_it.name)
+                if target is not None:
+                    for field in ["original_price", "member_price", "doctor_fee",
+                                  "material_fee", "cost_price", "category",
+                                  "display_name", "internal_name", "remark"]:
+                        if hasattr(target, field) and hasattr(old_it, field):
+                            setattr(target, field, getattr(old_it, field))
+                    target.update_timestamp()
+                    applied += 1
+
+        if applied == 0:
+            QMessageBox.information(self, "提示", "选中的变更在当前数据中都不存在，未应用任何修改")
+            return
+
+        # 整份回滚前自动快照
+        try:
+            self.backup_manager.create_snapshot(
+                self.current_items,
+                name=f"部分回滚前备份_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                description="部分回滚前自动备份",
+            )
+        except Exception:
+            pass
+
+        self.partialRollbackRequested.emit(list(self.current_items))
+        self._refresh_snapshots()
+        QMessageBox.information(
+            self, "部分回滚完成",
+            f"已成功应用 {applied} 条变更到当前数据。\n\n"
+            f"（整份数据版本已通过 partialRollbackRequested 信号发出，需要到各页面同步）"
+        )
 
     def set_items(self, items: List[PriceItem]):
         self.current_items = items
@@ -298,7 +659,6 @@ class BackupPage(QWidget):
         if len(items) > 100:
             self.detail_table.insertRow(100)
             cell = QTableWidgetItem(f"... 仅显示前100条，共 {len(items)} 条记录 ...")
-            cell.setColumnCount(len(headers))
             cell.setTextAlignment(Qt.AlignCenter)
             cell.setForeground(QBrush(QColor("#64748b")))
             self.detail_table.setItem(100, 0, cell)
@@ -412,7 +772,6 @@ class BackupPage(QWidget):
         act_export = QAction("📤 导出此快照", self)
         act_rename = QAction("✏️ 重命名", self)
         act_delete = QAction("🗑️ 删除", self)
-        act_delete.setIconText("❌")
 
         menu.addAction(act_rollback)
         menu.addAction(act_export)

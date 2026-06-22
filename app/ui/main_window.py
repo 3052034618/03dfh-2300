@@ -194,6 +194,7 @@ class MainWindow(QMainWindow):
         self.validation_page.saveRequested.connect(self._save_all)
         self.batch_page.itemsUpdated.connect(self._on_items_updated)
         self.backup_page.rollbackRequested.connect(self._on_rollback)
+        self.backup_page.partialRollbackRequested.connect(self._on_rollback)
 
         self.btn_save_all.clicked.connect(self._save_all)
         self.btn_export_sample.clicked.connect(self._export_sample_template)

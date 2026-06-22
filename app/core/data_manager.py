@@ -61,7 +61,39 @@ class ExcelImporter:
             return 0.0
 
     @classmethod
-    def import_file(cls, file_path: str) -> Tuple[List[PriceItem], List[str]]:
+    def inspect_file(cls, file_path: str, preview_rows: int = 5) -> Tuple[List[str], List[List[Any]], List[str]]:
+        """仅读取表头和前 N 行预览，不做字段映射，供用户手动匹配列。
+        返回 (headers, preview_rows, warnings)
+        """
+        warnings = []
+        if not os.path.exists(file_path):
+            return [], [], [f"文件不存在: {file_path}"]
+        try:
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext in [".xlsx", ".xls"]:
+                df = pd.read_excel(file_path, dtype=object)
+            elif ext == ".csv":
+                df = pd.read_csv(file_path, dtype=object)
+            else:
+                return [], [], [f"不支持的文件格式: {ext}"]
+            if df.empty:
+                return [], [], ["表格内容为空"]
+            headers = [str(h).strip() if h is not None else f"列{i+1}" for i, h in enumerate(df.columns)]
+            preview = []
+            for _, row in df.head(preview_rows).iterrows():
+                preview.append([("" if v is None else str(v)) for v in row.tolist()])
+            # 补全：如果有的行比 header 短，用空串填充
+            for r in preview:
+                while len(r) < len(headers):
+                    r.append("")
+            return headers, preview, warnings
+        except Exception as e:
+            return [], [], [f"读取文件失败: {str(e)}"]
+
+    @classmethod
+    def import_file(cls, file_path: str,
+                    col_mapping: Optional[Dict[str, int]] = None) -> Tuple[List[PriceItem], List[str]]:
+        """导入 Excel。如果传了 col_mapping 则使用用户手动匹配的结果，否则自动识别。"""
         if not os.path.exists(file_path):
             return [], [f"文件不存在: {file_path}"]
 
@@ -81,9 +113,13 @@ class ExcelImporter:
                 return [], ["表格内容为空"]
 
             headers = list(df.columns)
-            col_mapping = cls._map_columns(headers)
+            if col_mapping is not None and len(col_mapping) > 0:
+                # 使用用户手动匹配
+                col_mapping = {k: v for k, v in col_mapping.items() if v is not None and v >= 0}
+            else:
+                col_mapping = cls._map_columns(headers)
 
-            if "name" not in col_mapping:
+            if "name" not in col_mapping and len(headers) > 0:
                 warnings.append("未识别到'项目名称'列，将尝试使用第一列作为名称")
                 col_mapping["name"] = 0
 
