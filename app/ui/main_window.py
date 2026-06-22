@@ -17,6 +17,7 @@ from .print_page import PrintPage
 from .backup_page import BackupPage
 from ..core.models import PriceItem
 from ..core.data_manager import DataStore
+from ..core.price_engine import PriceValidator
 
 
 class MainWindow(QMainWindow):
@@ -27,6 +28,7 @@ class MainWindow(QMainWindow):
         data_dir = os.path.join(base_dir, "data")
         backup_dir = os.path.join(base_dir, "backups")
         self.data_store = DataStore(data_dir, backup_dir)
+        self._has_unsaved_changes = False
 
         self.setWindowTitle("医美价目表批量维护工具")
         self.setMinimumSize(1280, 800)
@@ -35,7 +37,7 @@ class MainWindow(QMainWindow):
 
         self._init_ui()
         self._connect_signals()
-        self._sync_items_from_store()
+        self._update_save_status(False)
 
     def _init_ui(self):
         central = QWidget()
@@ -189,6 +191,7 @@ class MainWindow(QMainWindow):
 
         self.import_page.itemsImported.connect(self._on_items_imported)
         self.validation_page.itemsUpdated.connect(self._on_items_updated)
+        self.validation_page.saveRequested.connect(self._save_all)
         self.batch_page.itemsUpdated.connect(self._on_items_updated)
         self.backup_page.rollbackRequested.connect(self._on_rollback)
 
@@ -214,38 +217,78 @@ class MainWindow(QMainWindow):
 
     def _on_items_imported(self, items: List[PriceItem]):
         self.data_store.set_items(items)
-        try:
-            ok, errors = self.data_store.save(
+
+        can_save, errors = PriceValidator.can_save(items)
+        has_issues = len(errors) > 0
+
+        if has_issues:
+            cost_count = sum(1 for e in errors if "低于成本价" in e)
+            member_count = sum(1 for e in errors if "会员价" in e)
+
+            msg_parts = [f"已导入 {len(items)} 个项目，存在 {len(errors)} 个问题需要处理。\n"]
+            if cost_count:
+                msg_parts.append(f"\n⚠️ 低于成本价：{cost_count} 项")
+            if member_count:
+                msg_parts.append(f"\n⚠️ 会员价异常：{member_count} 项")
+            msg_parts.append("\n\n数据已加载但尚未保存，请在「价格校验」页修复后再保存。")
+            QMessageBox.warning(self, "导入完成（待保存）", "".join(msg_parts))
+            self._has_unsaved_changes = True
+        else:
+            ok, _ = self.data_store.save(
                 create_snapshot=True,
                 snapshot_name=f"导入_{len(items)}项",
                 snapshot_desc=f"从外部文件导入的初始价目表数据"
             )
-            if errors:
-                QMessageBox.warning(self, "部分校验问题",
-                                    f"已保存，但有 {len(errors)} 个项目存在校验问题，建议前往「价格校验」页面处理。")
-        except Exception as e:
-            QMessageBox.warning(self, "保存提示",
-                                f"数据已加载，保存快照时提示：{str(e)}。\n可手动到备份页面创建快照。")
-            self.data_store.items = items
+            if ok:
+                self._has_unsaved_changes = False
+                QMessageBox.information(self, "导入成功",
+                                       f"已导入并保存 {len(items)} 个项目。\n可前往「价格校验」页面查看。")
 
-        self._sync_items_from_store()
-        self.statusBar().showMessage(f"已导入 {len(items)} 个项目", 5000)
+        self._update_save_status(has_issues)
 
         self.nav_buttons[1][0].setChecked(True)
         self._switch_page(1)
 
+    def _update_save_status(self, has_unsaved: bool = None):
+        if has_unsaved is None:
+            has_unsaved = self._has_unsaved_changes
+        count = len(self.data_store.items)
+        if count == 0:
+            self.item_count_label.setText("项目数：0")
+            self.item_count_label.setStyleSheet("""
+                padding: 6px 14px; background: #eff6ff; color: #1e40af;
+                border-radius: 6px; font-weight: 600;
+            """)
+            self.setWindowTitle("医美价目表批量维护工具")
+        elif has_unsaved:
+            self.item_count_label.setText(f"项目数：{count} ⚠️未保存")
+            self.item_count_label.setStyleSheet("""
+                padding: 6px 14px; background: #fef3c7; color: #92400e;
+                border-radius: 6px; font-weight: 600;
+            """)
+            self.setWindowTitle("*医美价目表批量维护工具 - 未保存")
+        else:
+            self.item_count_label.setText(f"项目数：{count}")
+            self.item_count_label.setStyleSheet("""
+                padding: 6px 14px; background: #eff6ff; color: #1e40af;
+                border-radius: 6px; font-weight: 600;
+            """)
+            self.setWindowTitle("医美价目表批量维护工具")
+
     def _on_items_updated(self, items: List[PriceItem]):
         self.data_store.set_items(items)
-        self._sync_items_from_store()
-        self.statusBar().showMessage(f"已更新 {len(items)} 个项目", 3000)
+        self._has_unsaved_changes = True
+        self._update_save_status(True)
+        self.statusBar().showMessage(f"已更新 {len(items)} 个项目（未保存）", 3000)
 
     def _on_rollback(self, items: List[PriceItem]):
         self.data_store.set_items(items)
         try:
-            self.data_store._save_data_only() if hasattr(self.data_store, "_save_data_only") else None
+            self.data_store._save_data_only()
+            self._has_unsaved_changes = False
         except Exception:
             pass
-        self._sync_items_from_store()
+        self._update_save_status(False)
         self.statusBar().showMessage(f"已回滚到 {len(items)} 个项目", 3000)
 
         for page_idx in [1, 2, 3]:
@@ -264,25 +307,42 @@ class MainWindow(QMainWindow):
         )
 
         if ok:
-            self._sync_items_from_store()
+            self._has_unsaved_changes = False
+            self._update_save_status(False)
+            self._update_original_snapshots()
             QMessageBox.information(self, "保存成功",
                                     f"已保存 {len(self.data_store.items)} 个项目\n"
                                     f"并创建了对应快照备份。")
             self.statusBar().showMessage("保存成功", 3000)
         else:
-            reply = QMessageBox.question(
-                self, "保存提示",
-                f"存在 {len(errors)} 个校验问题，部分操作可能无法正常工作。\n\n"
-                + "\n".join(errors[:5]) + ("\n..." if len(errors) > 5 else "") +
-                "\n\n是否仍要强制保存？",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-            )
-            if reply == QMessageBox.Yes:
-                import json
-                with open(self.data_store.data_file, "w", encoding="utf-8") as f:
-                    json.dump([it.to_dict() for it in self.data_store.items], f, ensure_ascii=False, indent=2)
-                self._sync_items_from_store()
-                QMessageBox.information(self, "已保存", "数据已保存，但未创建快照。")
+            cost_errors = [e for e in errors if "低于成本价" in e]
+            member_errors = [e for e in errors if "会员价" in e]
+            other_errors = [e for e in errors if e not in cost_errors and e not in member_errors]
+
+            msg_parts = []
+            msg_parts.append(f"发现 {len(errors)} 个问题，无法保存。\n")
+            if cost_errors:
+                msg_parts.append(f"\n⚠️ 低于成本价（{len(cost_errors)}项）：")
+                msg_parts.append("   原价或会员价低于医生费+耗材费+成本价")
+            if member_errors:
+                msg_parts.append(f"\n⚠️ 会员价异常（{len(member_errors)}项）：")
+                msg_parts.append("   会员价高于原价")
+            if other_errors:
+                msg_parts.append(f"\n⚠️ 其他问题（{len(other_errors)}项）")
+            msg_parts.append("\n\n请前往「价格校验」页面修复后再保存。")
+
+            QMessageBox.warning(self, "保存失败", "".join(msg_parts))
+            self.nav_buttons[1][0].setChecked(True)
+            self._switch_page(1)
+
+    def _update_original_snapshots(self):
+        if hasattr(self, 'validation_page'):
+            self.validation_page._original_snapshot = [
+                PriceItem(**{k: getattr(it, k) for k in PriceItem.__dataclass_fields__})
+                for it in self.data_store.items
+            ]
+        if hasattr(self, 'batch_page'):
+            self.batch_page._history = []
 
     def _export_sample_template(self):
         from openpyxl import Workbook

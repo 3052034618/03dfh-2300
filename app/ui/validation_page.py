@@ -14,6 +14,7 @@ from ..core.price_engine import PriceValidator
 
 class ValidationPage(QWidget):
     itemsUpdated = Signal(list)
+    saveRequested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -371,40 +372,67 @@ class ValidationPage(QWidget):
             QMessageBox.information(self, "提示", "没有需要修复的会员价")
 
     def _fix_cost_prices(self):
+        below_items = self.validations.get("below_cost", [])
+        if not below_items:
+            QMessageBox.information(self, "提示", "没有需要修复的成本价问题")
+            return
+
+        unique_items = {}
+        for item, msg in below_items:
+            unique_items[item.id] = item
+
         count = 0
-        for item, _ in self.validations.get("below_cost", []):
+        for item in unique_items.values():
             total_cost = item.total_cost
-            min_price = round(total_cost * 1.1, 2)
-            if item.original_price < min_price:
-                item.original_price = min_price
+            if total_cost <= 0:
+                continue
+
+            changed = False
+
+            if item.original_price < total_cost:
+                item.original_price = round(total_cost * 1.1, 2)
+                changed = True
+
+            if item.member_price > 0 and item.member_price < total_cost:
+                item.member_price = round(total_cost * 1.05, 2)
+                changed = True
+
+            if item.member_price > 0 and item.member_price >= item.original_price:
+                item.member_price = round(item.original_price * 0.9, 2)
+                changed = True
+
+            if changed:
                 item.update_timestamp()
-            if item.member_price > 0 and item.member_price < min_price:
-                item.member_price = round(min_price * 0.95, 2)
-                item.update_timestamp()
-            count += 1
+                count += 1
 
         if count > 0:
             self.run_validation()
-            QMessageBox.information(self, "修复完成", f"已修复 {count} 个低于成本价的项目")
+            QMessageBox.information(
+                self, "修复完成",
+                f"已修复 {count} 个低于成本价的项目\n\n"
+                f"• 原价：不低于总成本的1.1倍\n"
+                f"• 会员价：不低于总成本的1.05倍\n"
+                f"• 确保会员价始终低于原价"
+            )
         else:
             QMessageBox.information(self, "提示", "没有需要修复的成本价问题")
 
     def _save_changes(self):
         can_save, errors = PriceValidator.can_save(self.current_items)
         if not can_save:
-            reply = QMessageBox.question(
-                self, "存在错误",
-                f"发现 {len(errors)} 个问题项目，这些项目保存时可能影响后续计算：\n\n"
-                + "\n".join(errors[:8]) + ("\n..." if len(errors) > 8 else "") +
-                f"\n\n是否继续保存（有问题的项目将保留）？",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-            )
-            if reply != QMessageBox.Yes:
-                return
+            cost_errors = [e for e in errors if "低于成本价" in e]
+            msg = f"发现 {len(errors)} 个校验问题，无法保存。\n\n"
+            if cost_errors:
+                msg += f"⚠️ 有 {len(cost_errors)} 个项目的价格低于总成本\n"
+                msg += "   请使用「一键修复成本价」或手动调整\n\n"
+            other = len(errors) - len(cost_errors)
+            if other > 0:
+                msg += f"⚠️ 其他问题 {other} 个（如会员价高于原价等）\n\n"
+            msg += "请修复所有问题后再保存。"
+            QMessageBox.warning(self, "无法保存", msg)
+            return
 
-        self._original_snapshot = [PriceItem(**{k: getattr(it, k) for k in PriceItem.__dataclass_fields__}) for it in self.current_items]
-        self.itemsUpdated.emit(self.current_items)
-        QMessageBox.information(self, "保存成功", f"已保存 {len(self.current_items)} 个项目的修改")
+        self.saveRequested.emit()
 
     def _rollback_changes(self):
         if not self._original_snapshot:

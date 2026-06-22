@@ -9,15 +9,29 @@ from PySide6.QtWidgets import (
     QGroupBox, QSpinBox, QSizePolicy
 )
 from PySide6.QtCore import Qt, Signal, QUrl
-from PySide6.QtGui import QAction, QIcon, QPainter, QPdfWriter, QPageSize, QPageLayout, QPixmap
-from PySide6.QtPdfWidgets import QPdfView
-from PySide6.QtPdf import QPdfDocument
-from PySide6.QtPrintSupport import QPrinter, QPrintDialog, QPrintPreviewDialog
+from PySide6.QtGui import QAction, QIcon, QPainter, QPixmap
 
 from .widgets import StatCard
 from ..core.models import PriceItem, CategoryManager
 from ..core.pdf_generator import PDFGenerator
 from ..core.data_manager import ExcelImporter
+
+
+def _has_pdf_support() -> bool:
+    try:
+        from PySide6.QtPdf import QPdfDocument
+        from PySide6.QtPdfWidgets import QPdfView
+        return True
+    except ImportError:
+        return False
+
+
+def _has_print_support() -> bool:
+    try:
+        from PySide6.QtPrintSupport import QPrinter, QPrintDialog
+        return True
+    except ImportError:
+        return False
 
 
 class PrintPage(QWidget):
