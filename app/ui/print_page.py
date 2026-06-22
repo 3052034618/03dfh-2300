@@ -6,32 +6,27 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QMessageBox,
     QFrame, QComboBox, QLineEdit, QCheckBox, QSplitter, QFileDialog,
-    QGroupBox, QSpinBox, QSizePolicy
+    QGroupBox, QSpinBox, QSizePolicy, QGridLayout
 )
 from PySide6.QtCore import Qt, Signal, QUrl
 from PySide6.QtGui import QAction, QIcon, QPainter, QPixmap
 
 from .widgets import StatCard
 from ..core.models import PriceItem, CategoryManager
-from ..core.pdf_generator import PDFGenerator
 from ..core.data_manager import ExcelImporter
 
 
-def _has_pdf_support() -> bool:
+def _try_import_pdf_generator():
     try:
-        from PySide6.QtPdf import QPdfDocument
-        from PySide6.QtPdfWidgets import QPdfView
-        return True
-    except ImportError:
-        return False
+        from ..core.pdf_generator import PDFGenerator
+        return PDFGenerator
+    except Exception as e:
+        print(f"[WARN] PDFGenerator 导入失败：{e}")
+        return None
 
 
-def _has_print_support() -> bool:
-    try:
-        from PySide6.QtPrintSupport import QPrinter, QPrintDialog
-        return True
-    except ImportError:
-        return False
+def _has_os_startfile() -> bool:
+    return hasattr(os, "startfile")
 
 
 class PrintPage(QWidget):
@@ -41,13 +36,13 @@ class PrintPage(QWidget):
         super().__init__(parent)
         self.current_items: List[PriceItem] = []
         self._temp_pdf_path = None
-        self._pdf_doc = None
+        self._pdf_generator = None
         self._init_ui()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(25, 20, 25, 20)
-        layout.setSpacing(15)
+        layout.setSpacing(12)
 
         title = QLabel("打印与导出")
         title.setObjectName("PageTitle")
@@ -56,6 +51,24 @@ class PrintPage(QWidget):
         subtitle = QLabel("生成 A4 打印版价目表、咨询师精简版，或导出 Excel/CSV 格式")
         subtitle.setObjectName("PageSubtitle")
         layout.addWidget(subtitle)
+
+        self._pdf_generator = _try_import_pdf_generator()
+        if self._pdf_generator is None or not _has_os_startfile():
+            warn = QLabel()
+            warn_parts = []
+            if self._pdf_generator is None:
+                warn_parts.append("⚠️ PDF生成能力不可用（缺少 reportlab 或字体异常）")
+            if not _has_os_startfile():
+                warn_parts.append("⚠️ 系统不支持直接打开文件")
+            if warn_parts:
+                warn_parts.append("，但 Excel/CSV 导出不受影响")
+                warn.setText(" ".join(warn_parts))
+                warn.setStyleSheet("""
+                    padding: 10px 14px; background: #fef3c7; color: #92400e;
+                    border-radius: 6px; font-weight: 500;
+                """)
+                warn.setWordWrap(True)
+                layout.addWidget(warn)
 
         splitter = QSplitter(Qt.Horizontal)
 
@@ -111,7 +124,13 @@ class PrintPage(QWidget):
         btn_row = QHBoxLayout()
         self.btn_preview = QPushButton("🔍 预览PDF")
         self.btn_preview.setObjectName("PrimaryButton")
+        if self._pdf_generator is None:
+            self.btn_preview.setEnabled(False)
+            self.btn_preview.setToolTip("PDF生成组件不可用")
         self.btn_print = QPushButton("🖨️ 打印")
+        if not _has_os_startfile():
+            self.btn_print.setEnabled(False)
+            self.btn_print.setToolTip("当前系统不支持直接打印")
         btn_row.addWidget(self.btn_preview)
         btn_row.addWidget(self.btn_print)
         s_layout.addLayout(btn_row)
@@ -120,6 +139,9 @@ class PrintPage(QWidget):
         export_layout = QGridLayout(export_group)
         self.btn_export_pdf = QPushButton("导出 PDF")
         self.btn_export_pdf.setObjectName("PrimaryButton")
+        if self._pdf_generator is None:
+            self.btn_export_pdf.setEnabled(False)
+            self.btn_export_pdf.setToolTip("PDF生成组件不可用")
         self.btn_export_excel = QPushButton("导出 Excel 完整版")
         self.btn_export_simple = QPushButton("导出 Excel 精简版")
         self.btn_export_csv = QPushButton("导出咨询师 CSV")
@@ -201,69 +223,86 @@ class PrintPage(QWidget):
         return filtered
 
     def _refresh_preview(self):
-        items = self._get_filtered_items()
+        try:
+            items = self._get_filtered_items()
+        except Exception as e:
+            print(f"[WARN] 刷新预览出错：{e}")
+            return
+
         exp_type = self.export_type.currentData()
 
-        if exp_type == "consultant":
-            headers = ["项目", "类别", "原价", "会员价", "底价"]
-            self.preview_table.setColumnCount(len(headers))
-            self.preview_table.setHorizontalHeaderLabels(headers)
-            self.preview_table.setRowCount(len(items))
-            for row, it in enumerate(items):
-                name = it.display_name or it.name
-                if len(name) > 18:
-                    name = name[:18] + "..."
-                values = [
-                    name, it.category or "-",
-                    f"¥{it.original_price:,.0f}" if it.original_price > 0 else "-",
-                    f"¥{it.member_price:,.0f}" if it.member_price > 0 else "-",
-                    f"¥{it.total_cost:,.0f}" if it.total_cost > 0 else "-"
-                ]
-                for col, val in enumerate(values):
-                    cell = QTableWidgetItem(val)
-                    if col >= 2:
-                        cell.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
-                    self.preview_table.setItem(row, col, cell)
-        else:
-            include_member = exp_type != "a4_no_member"
-            if include_member:
-                headers = ["项目名称", "分类", "原价", "会员价", "备注"]
+        try:
+            if exp_type == "consultant":
+                headers = ["项目", "类别", "原价", "会员价", "底价"]
+                self.preview_table.setColumnCount(len(headers))
+                self.preview_table.setHorizontalHeaderLabels(headers)
+                self.preview_table.setRowCount(len(items))
+                for row, it in enumerate(items):
+                    name = it.display_name or it.name
+                    if len(name) > 18:
+                        name = name[:18] + "..."
+                    values = [
+                        name, it.category or "-",
+                        f"¥{it.original_price:,.0f}" if it.original_price > 0 else "-",
+                        f"¥{it.member_price:,.0f}" if it.member_price > 0 else "-",
+                        f"¥{it.total_cost:,.0f}" if it.total_cost > 0 else "-"
+                    ]
+                    for col, val in enumerate(values):
+                        cell = QTableWidgetItem(val)
+                        if col >= 2:
+                            cell.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+                        self.preview_table.setItem(row, col, cell)
             else:
-                headers = ["项目名称", "分类", "价格", "备注"]
-            self.preview_table.setColumnCount(len(headers))
-            self.preview_table.setHorizontalHeaderLabels(headers)
-            self.preview_table.setRowCount(len(items))
-            for row, it in enumerate(items):
+                include_member = exp_type != "a4_no_member"
                 if include_member:
-                    values = [
-                        it.display_name or it.name, it.category or "-",
-                        f"¥{it.original_price:,.2f}" if it.original_price > 0 else "-",
-                        f"¥{it.member_price:,.2f}" if it.member_price > 0 else "-",
-                        it.remark or "-" if self.chk_remark.isChecked() else ""
-                    ]
+                    headers = ["项目名称", "分类", "原价", "会员价", "备注"]
                 else:
-                    values = [
-                        it.display_name or it.name, it.category or "-",
-                        f"¥{it.original_price:,.2f}" if it.original_price > 0 else "-",
-                        it.remark or "-" if self.chk_remark.isChecked() else ""
-                    ]
-                for col, val in enumerate(values):
-                    cell = QTableWidgetItem(val)
-                    if col >= 2:
-                        cell.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
-                    self.preview_table.setItem(row, col, cell)
+                    headers = ["项目名称", "分类", "价格", "备注"]
+                self.preview_table.setColumnCount(len(headers))
+                self.preview_table.setHorizontalHeaderLabels(headers)
+                self.preview_table.setRowCount(len(items))
+                for row, it in enumerate(items):
+                    if include_member:
+                        values = [
+                            it.display_name or it.name, it.category or "-",
+                            f"¥{it.original_price:,.2f}" if it.original_price > 0 else "-",
+                            f"¥{it.member_price:,.2f}" if it.member_price > 0 else "-",
+                            it.remark or "-" if self.chk_remark.isChecked() else ""
+                        ]
+                    else:
+                        values = [
+                            it.display_name or it.name, it.category or "-",
+                            f"¥{it.original_price:,.2f}" if it.original_price > 0 else "-",
+                            it.remark or "-" if self.chk_remark.isChecked() else ""
+                        ]
+                    for col, val in enumerate(values):
+                        cell = QTableWidgetItem(val)
+                        if col >= 2:
+                            cell.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+                        self.preview_table.setItem(row, col, cell)
 
-        for col in range(self.preview_table.columnCount()):
-            self.preview_table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeToContents)
-        self.preview_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+            for col in range(self.preview_table.columnCount()):
+                self.preview_table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeToContents)
+            self.preview_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
 
-        self.stat_display.update_value(str(len(items)))
-        cats_used = set(it.category for it in items)
-        self.stat_cats_used.update_value(str(len(cats_used)))
-        total = sum(it.original_price for it in items)
-        self.stat_total_amount.update_value(f"¥{total:,.0f}")
+            self.stat_display.update_value(str(len(items)))
+            cats_used = set(it.category for it in items)
+            self.stat_cats_used.update_value(str(len(cats_used)))
+            total = sum(it.original_price for it in items)
+            self.stat_total_amount.update_value(f"¥{total:,.0f}")
+        except Exception as e:
+            print(f"[WARN] 构建预览表格出错：{e}")
 
     def _prepare_temp_pdf(self) -> str:
+        if self._pdf_generator is None:
+            QMessageBox.warning(
+                self, "功能不可用",
+                "PDF生成组件不可用（缺少 reportlab 或字体异常）。\n\n"
+                "请先执行：pip install reportlab\n\n"
+                "或使用「导出 Excel」功能代替。"
+            )
+            return ""
+
         items = self._get_filtered_items()
         if not items:
             QMessageBox.warning(self, "提示", "没有可导出的项目")
@@ -279,15 +318,23 @@ class PrintPage(QWidget):
 
         try:
             if exp_type == "consultant":
-                PDFGenerator.generate_consultant_list(items, pdf_path, title=title)
+                self._pdf_generator.generate_consultant_list(items, pdf_path, title=title)
             else:
                 include_member = exp_type != "a4_no_member"
-                PDFGenerator.generate_a4_price_list(items, pdf_path,
-                                                   title=title, subtitle=subtitle,
-                                                   include_member=include_member)
+                self._pdf_generator.generate_a4_price_list(
+                    items, pdf_path, title=title, subtitle=subtitle, include_member=include_member
+                )
+            if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) < 100:
+                raise Exception("PDF文件生成异常或为空")
             return pdf_path
         except Exception as e:
-            QMessageBox.critical(self, "生成失败", f"PDF生成失败：{str(e)}")
+            QMessageBox.critical(
+                self, "PDF生成失败",
+                f"生成PDF时出现错误：\n{str(e)}\n\n"
+                "建议：\n1. 确认已安装 reportlab\n"
+                "2. 确认系统包含微软雅黑或宋体字体\n"
+                "3. 使用 Excel 导出功能替代"
+            )
             return ""
 
     def _generate_and_preview(self):
@@ -295,40 +342,74 @@ class PrintPage(QWidget):
         if not pdf_path:
             return
 
-        try:
-            from PySide6.QtPdf import QPdfDocument
-            from PySide6.QtPdfWidgets import QPdfView
-
+        if _has_os_startfile():
             dialog = QMessageBox(self)
             dialog.setWindowTitle("PDF 已生成")
-            dialog.setText(f"PDF 已成功生成！\n\n路径：{pdf_path}\n\n请使用系统默认PDF阅读器打开，或使用下方功能导出。")
+            dialog.setText(
+                f"PDF 已成功生成！\n\n"
+                f"文件位置：{pdf_path}\n\n"
+                f"请选择后续操作："
+            )
             dialog.setIcon(QMessageBox.Information)
-            open_btn = dialog.addButton("📂 打开文件夹", QMessageBox.ActionRole)
-            view_btn = dialog.addButton("📖 打开文件", QMessageBox.ActionRole)
-            ok_btn = dialog.addButton("确定", QMessageBox.AcceptRole)
+            open_folder_btn = dialog.addButton("📂 打开所在文件夹", QMessageBox.ActionRole)
+            open_file_btn = dialog.addButton("📖 打开 PDF 文件", QMessageBox.ActionRole)
+            ok_btn = dialog.addButton("知道了", QMessageBox.AcceptRole)
             dialog.exec()
 
             clicked = dialog.clickedButton()
-            if clicked == open_btn:
-                folder = os.path.dirname(pdf_path)
-                os.startfile(folder) if hasattr(os, "startfile") else None
-            elif clicked == view_btn:
-                os.startfile(pdf_path) if hasattr(os, "startfile") else None
-        except Exception as e:
-            QMessageBox.information(self, "完成", f"PDF 已生成：\n{pdf_path}")
+            try:
+                if clicked == open_folder_btn:
+                    folder = os.path.dirname(pdf_path)
+                    os.startfile(folder)
+                elif clicked == open_file_btn:
+                    os.startfile(pdf_path)
+            except Exception as e:
+                QMessageBox.information(
+                    self, "提示",
+                    f"无法自动打开文件，请手动找到文件：\n{pdf_path}\n\n错误：{e}"
+                )
+        else:
+            QMessageBox.information(
+                self, "PDF已生成",
+                f"PDF 文件已生成，请手动打开：\n{pdf_path}"
+            )
 
     def _do_print(self):
         pdf_path = self._prepare_temp_pdf()
         if not pdf_path:
             return
 
+        if not _has_os_startfile():
+            QMessageBox.warning(
+                self, "打印不可用",
+                "当前系统不支持直接发送打印命令。\n\n"
+                f"请手动打开 PDF 文件后打印：\n{pdf_path}"
+            )
+            return
+
         try:
-            os.startfile(pdf_path, "print") if hasattr(os, "startfile") else None
-            QMessageBox.information(self, "已发送打印", "打印任务已发送到系统打印队列\n（将使用默认 PDF 阅读器的打印功能）")
+            os.startfile(pdf_path, "print")
+            QMessageBox.information(
+                self, "已发送打印",
+                "打印任务已发送到系统默认 PDF 阅读器。\n\n"
+                "说明：Windows 会使用默认 PDF 阅读器（如 Edge/Adobe Reader）弹出打印对话框，请在其中确认打印。\n\n"
+                f"文件位置：{pdf_path}"
+            )
         except Exception as e:
-            QMessageBox.critical(self, "打印失败", f"打印操作失败：{str(e)}")
+            QMessageBox.warning(
+                self, "打印操作失败",
+                f"无法自动发送打印任务：{e}\n\n"
+                f"请手动打开 PDF 文件并执行打印：\n{pdf_path}"
+            )
 
     def _export_pdf(self):
+        if self._pdf_generator is None:
+            QMessageBox.warning(
+                self, "功能不可用",
+                "PDF生成组件不可用。\n\n请使用 Excel 导出功能。"
+            )
+            return
+
         items = self._get_filtered_items()
         if not items:
             QMessageBox.warning(self, "提示", "没有可导出的项目")
@@ -347,15 +428,17 @@ class PrintPage(QWidget):
 
         try:
             if exp_type == "consultant":
-                PDFGenerator.generate_consultant_list(items, file_path, title=title)
+                self._pdf_generator.generate_consultant_list(items, file_path, title=title)
             else:
                 include_member = exp_type != "a4_no_member"
-                PDFGenerator.generate_a4_price_list(items, file_path,
-                                                   title=title, subtitle=subtitle,
-                                                   include_member=include_member)
+                self._pdf_generator.generate_a4_price_list(
+                    items, file_path, title=title, subtitle=subtitle, include_member=include_member
+                )
+            if not os.path.exists(file_path) or os.path.getsize(file_path) < 100:
+                raise Exception("PDF文件为空")
             QMessageBox.information(self, "导出成功", f"PDF 已保存到：\n{file_path}")
         except Exception as e:
-            QMessageBox.critical(self, "导出失败", f"导出失败：{str(e)}")
+            QMessageBox.critical(self, "导出失败", f"PDF 导出失败：{str(e)}")
 
     def _export_excel(self, full: bool):
         items = self._get_filtered_items()
@@ -375,7 +458,7 @@ class PrintPage(QWidget):
             ExcelImporter.export_items(items, file_path, include_internal=full)
             QMessageBox.information(self, "导出成功", f"Excel 已保存到：\n{file_path}")
         except Exception as e:
-            QMessageBox.critical(self, "导出失败", f"导出失败：{str(e)}")
+            QMessageBox.critical(self, "导出失败", f"Excel 导出失败：{str(e)}")
 
     def _export_csv(self):
         items = self._get_filtered_items()
@@ -391,7 +474,26 @@ class PrintPage(QWidget):
             return
 
         try:
-            PDFGenerator.generate_csv_consultant_list(items, file_path)
+            import csv
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(["项目名称", "前台展示名", "分类", "原价", "会员价",
+                               "医生费", "耗材费", "耗材品牌", "成本价", "底价", "备注"])
+                for it in sorted(items, key=lambda x: (x.category, x.name)):
+                    writer.writerow([
+                        it.name,
+                        it.display_name or it.name,
+                        it.category,
+                        it.original_price,
+                        it.member_price,
+                        it.doctor_fee,
+                        it.material_fee,
+                        it.material_brand,
+                        it.cost_price,
+                        it.total_cost,
+                        it.remark
+                    ])
             QMessageBox.information(self, "导出成功", f"CSV 已保存到：\n{file_path}")
         except Exception as e:
-            QMessageBox.critical(self, "导出失败", f"导出失败：{str(e)}")
+            QMessageBox.critical(self, "导出失败", f"CSV 导出失败：{str(e)}")
