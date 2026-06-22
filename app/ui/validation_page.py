@@ -42,7 +42,7 @@ class ValidationPage(QWidget):
         stats_row = QHBoxLayout()
         self.stat_member = StatCard("会员价异常", "0", "#ef4444")
         self.stat_cost = StatCard("低于成本价", "0", "#f59e0b")
-        self.stat_dup = StatCard("重名项目", "0", "#8b5cf6")
+        self.stat_dup = StatCard("同名不同价", "0", "#8b5cf6")
         self.stat_ok = StatCard("正常项目", "0", "#10b981")
         # 让每个 StatCard 本身也变成可点击的筛选入口
         for w in (self.stat_member, self.stat_cost, self.stat_dup, self.stat_ok):
@@ -187,16 +187,21 @@ class ValidationPage(QWidget):
 
         member_issues = validations["member_above_original"]
         cost_issues = validations["below_cost"]
-        duplicates = validations["duplicate_names"]
+        price_conflicts = validations["price_conflicts"]
 
         self.stat_member.update_value(str(len(member_issues)))
         self.stat_cost.update_value(str(len(cost_issues)))
-        self.stat_dup.update_value(str(len(duplicates)))
+        self.stat_dup.update_value(str(len(price_conflicts)))
+
+        conflict_ids = set()
+        for grp in price_conflicts.values():
+            for it in grp:
+                conflict_ids.add(it.id)
 
         ok_count = len(self.current_items) - len(set(
             [x[0].id for x in member_issues] +
             [x[0].id for x in cost_issues] +
-            [x.id for grp in duplicates.values() for x in grp]
+            list(conflict_ids)
         ))
         self.stat_ok.update_value(str(max(0, ok_count)))
 
@@ -234,7 +239,7 @@ class ValidationPage(QWidget):
 
         member_ids = {it[0].id for it in self.validations.get("member_above_original", [])}
         cost_ids = {it[0].id for it in self.validations.get("below_cost", [])}
-        dup_ids = {it.id for grp in self.validations.get("duplicate_names", {}).values() for it in grp}
+        dup_ids = {it.id for grp in self.validations.get("price_conflicts", {}).values() for it in grp}
 
         filtered = []
         for item in self.current_items:
@@ -518,9 +523,9 @@ class ValidationPage(QWidget):
         """根据当前筛选类别更新工作台状态提示文案"""
         label_map = {
             "all": "全部项目",
-            "member": "会员价高于原价（点击卡片旁的「一键修复会员价」可批量处理）",
-            "cost": "低于成本价（点击卡片旁的「一键修复成本价」可批量处理）",
-            "duplicate": "同名不同价（需要手动或批量合并冲突项目）",
+            "member": "会员价高于原价（点击「一键修复会员价」可批量处理）",
+            "cost": "低于成本价（点击「一键修复成本价」可批量处理）",
+            "duplicate": "同名不同价（同名但价格一致的不算问题）",
             "error": "所有有问题的项目",
             "ok": "正常项目",
         }
@@ -533,7 +538,7 @@ class ValidationPage(QWidget):
             elif filter_key == "cost":
                 remaining = len(set(x[0].id for x in self.validations.get("below_cost", [])))
             elif filter_key == "duplicate":
-                remaining = sum(len(g) for g in self.validations.get("duplicate_names", {}).values())
+                remaining = sum(len(g) for g in self.validations.get("price_conflicts", {}).values())
             elif filter_key == "ok":
                 remaining = int(self.stat_ok.value_label.text() or "0")
             elif filter_key == "error":
@@ -542,7 +547,7 @@ class ValidationPage(QWidget):
                     problem_ids.add(it.id)
                 for it, _ in self.validations.get("below_cost", []):
                     problem_ids.add(it.id)
-                for grp in self.validations.get("duplicate_names", {}).values():
+                for grp in self.validations.get("price_conflicts", {}).values():
                     for it in grp:
                         problem_ids.add(it.id)
                 remaining = len(problem_ids)

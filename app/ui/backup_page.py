@@ -13,7 +13,7 @@ from PySide6.QtGui import QColor, QBrush, QFont, QAction
 
 from .widgets import StatCard
 from ..core.models import PriceItem, Snapshot
-from ..core.data_manager import BackupManager
+from ..core.data_manager import BackupManager, OperationLogManager
 
 
 COMPARE_PRICE_FIELDS = [
@@ -24,6 +24,14 @@ COMPARE_PRICE_FIELDS = [
     ("cost_price", "成本价"),
 ]
 
+COMPARE_INFO_FIELDS = [
+    ("category", "分类"),
+    ("display_name", "前台展示名"),
+    ("internal_name", "内部核算名"),
+    ("remark", "备注"),
+    ("material_brand", "耗材品牌"),
+]
+
 
 def compare_two_snapshots(old_items: List[PriceItem],
                           new_items: List[PriceItem]) -> List[Dict[str, Any]]:
@@ -31,7 +39,9 @@ def compare_two_snapshots(old_items: List[PriceItem],
     每个元素:
       {"type": "added",   "item": new_item}
       {"type": "removed", "item": old_item}
-      {"type": "modified","old_item": old, "new_item": new, "changes": [(label, ov, nv), ...]}
+      {"type": "modified","old_item": old, "new_item": new,
+        "price_changes": [(label, ov, nv), ...],
+        "info_changes": [(label, ov, nv), ...]}
     """
     old_by_name = {it.name: it for it in old_items if it.name}
     new_by_name = {it.name: it for it in new_items if it.name}
@@ -42,26 +52,25 @@ def compare_two_snapshots(old_items: List[PriceItem],
             diffs.append({"type": "added", "item": new_it})
             continue
         old_it = old_by_name[name]
-        changed_fields: List = []
+        price_changes: List = []
         for field, label in COMPARE_PRICE_FIELDS:
             ov = float(getattr(old_it, field, 0.0) or 0.0)
             nv = float(getattr(new_it, field, 0.0) or 0.0)
             if abs(ov - nv) > 0.005:
-                changed_fields.append((label, ov, nv))
-        other_diff = (
-            old_it.category != new_it.category
-            or old_it.display_name != new_it.display_name
-            or old_it.internal_name != new_it.internal_name
-            or old_it.remark != new_it.remark
-        )
-        if other_diff:
-            changed_fields.append(("分类/展示/备注", "变更", "变更"))
-        if changed_fields:
+                price_changes.append((label, ov, nv))
+        info_changes: List = []
+        for field, label in COMPARE_INFO_FIELDS:
+            ov = str(getattr(old_it, field, "") or "")
+            nv = str(getattr(new_it, field, "") or "")
+            if ov != nv:
+                info_changes.append((label, ov, nv))
+        if price_changes or info_changes:
             diffs.append({
                 "type": "modified",
                 "old_item": old_it,
                 "new_item": new_it,
-                "changes": changed_fields,
+                "price_changes": price_changes,
+                "info_changes": info_changes,
             })
 
     for name, old_it in old_by_name.items():
@@ -219,7 +228,7 @@ class SnapshotCompareDialog(QDialog):
                 new_val = "—"
                 detail = "新版本中已被删除"
             else:
-                type_text = "🟡 变更（回滚=还原旧值）"
+                type_text = "🟡 变更（回滚=仅还原价格）"
                 new_item = d["new_item"]
                 old_item = d["old_item"]
                 category = new_item.category or "—"
@@ -228,12 +237,15 @@ class SnapshotCompareDialog(QDialog):
                 new_val = (f"¥{new_item.original_price:,.2f} / "
                            f"¥{new_item.member_price:,.2f}")
                 parts = []
-                for label, ov, nv in d.get("changes", []):
-                    if isinstance(ov, float) and isinstance(nv, float):
-                        parts.append(f"{label}: ¥{ov:,.2f} → ¥{nv:,.2f}")
-                    else:
-                        parts.append(f"{label}: 有变化")
-                detail = "；".join(parts) if parts else "未记录"
+                price_changes = d.get("price_changes", [])
+                info_changes = d.get("info_changes", [])
+                if price_changes:
+                    pcs = [f"{lab}: ¥{ov:,.2f}→¥{nv:,.2f}" for lab, ov, nv in price_changes]
+                    parts.append("💰价格：" + "；".join(pcs))
+                if info_changes:
+                    ics = [f"{lab}" for lab, _, _ in info_changes]
+                    parts.append("📝信息：" + "、".join(ics) + "（回滚不动此项）")
+                detail = " | ".join(parts) if parts else "未记录"
 
             ref_item = self._pick_item(d)
             name = ref_item.name or "（未命名）"
@@ -275,18 +287,31 @@ class SnapshotCompareDialog(QDialog):
         n_added = sum(1 for d in selected_diffs if d["type"] == "added")
         n_removed = sum(1 for d in selected_diffs if d["type"] == "removed")
         n_modified = sum(1 for d in selected_diffs if d["type"] == "modified")
+
+        price_field_labels = [lab for _, lab in COMPARE_PRICE_FIELDS]
+        info_field_labels = [lab for _, lab in COMPARE_INFO_FIELDS]
+
         summary_parts = []
         if n_added:
-            summary_parts.append(f"{n_added} 条新增 → 删除")
+            summary_parts.append(f"🟢 {n_added} 条新增 → 从当前数据删除")
         if n_removed:
-            summary_parts.append(f"{n_removed} 条删除 → 恢复")
+            summary_parts.append(f"🔴 {n_removed} 条删除 → 完整恢复到当前数据")
         if n_modified:
-            summary_parts.append(f"{n_modified} 条变更 → 还原旧值")
+            summary_parts.append(
+                f"🟡 {n_modified} 条价格变更 → 仅还原价格字段（"
+                + "、".join(price_field_labels) + "）\n"
+                + "        ⚠️ 分类、展示名、备注等信息字段保持不变"
+            )
+
+        detail_msg = (
+            f"将对当前数据应用 {len(selected_diffs)} 条变更：\n\n"
+            + "\n".join(f"  {p}" for p in summary_parts)
+            + f"\n\n信息类字段（{ '、'.join(info_field_labels) }）不会被回滚覆盖。\n"
+            + "是否继续？（回滚前会自动创建当前版本快照）"
+        )
+
         reply = QMessageBox.question(
-            self, "确认部分回滚",
-            f"将对当前数据应用 {len(selected_diffs)} 条变更：\n\n  • "
-            + "\n  • ".join(summary_parts)
-            + "\n\n是否继续？（回滚前会自动创建当前版本快照）",
+            self, "确认部分回滚", detail_msg,
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
@@ -299,12 +324,16 @@ class BackupPage(QWidget):
     rollbackRequested = Signal(list)
     partialRollbackRequested = Signal(list)
 
-    def __init__(self, backup_dir: str, parent=None):
+    def __init__(self, backup_dir: str,
+                 log_manager: Optional[OperationLogManager] = None,
+                 parent=None):
         super().__init__(parent)
         self.backup_manager = BackupManager(backup_dir)
+        self.log_manager = log_manager
         self.current_items: List[PriceItem] = []
         self._init_ui()
         self._refresh_snapshots()
+        self._refresh_logs()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -362,18 +391,110 @@ class BackupPage(QWidget):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(8)
 
-        left_header = QHBoxLayout()
-        left_header.addWidget(QLabel("<b>📋 快照列表</b>"))
-        left_header.addStretch()
+        # --- Tab 切换按钮（快照列表 / 操作记录）
+        tab_bar = QFrame()
+        tab_bar.setStyleSheet("QFrame { background: #f1f5f9; border-radius: 6px; padding: 2px; }")
+        tab_layout = QHBoxLayout(tab_bar)
+        tab_layout.setContentsMargins(2, 2, 2, 2)
+        tab_layout.setSpacing(2)
+
+        self.btn_tab_snapshots = QPushButton("📋 快照列表")
+        self.btn_tab_snapshots.setCheckable(True)
+        self.btn_tab_snapshots.setChecked(True)
+        self.btn_tab_snapshots.setCursor(Qt.PointingHandCursor)
+        self.btn_tab_snapshots.setStyleSheet("""
+            QPushButton {
+                background: white;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 12px;
+                font-weight: 600;
+                color: #1e293b;
+            }
+            QPushButton:checked {
+                background: #3b82f6;
+                color: white;
+            }
+        """)
+
+        self.btn_tab_logs = QPushButton("⏱️ 操作记录")
+        self.btn_tab_logs.setCheckable(True)
+        self.btn_tab_logs.setCursor(Qt.PointingHandCursor)
+        self.btn_tab_logs.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 12px;
+                font-weight: 500;
+                color: #64748b;
+            }
+            QPushButton:checked {
+                background: #3b82f6;
+                color: white;
+            }
+        """)
+
+        self.tab_group = QButtonGroup(self)
+        self.tab_group.addButton(self.btn_tab_snapshots, 0)
+        self.tab_group.addButton(self.btn_tab_logs, 1)
+        self.tab_group.setExclusive(True)
+
+        tab_layout.addWidget(self.btn_tab_snapshots)
+        tab_layout.addWidget(self.btn_tab_logs)
+        tab_layout.addStretch()
+        left_layout.addWidget(tab_bar)
+
+        # --- 内容区：快照列表 + 操作记录（QStackedWidget 切换）
+        self.list_stack = QStackedWidget()
+
+        # 页面1：快照列表
+        snap_page = QWidget()
+        snap_layout = QVBoxLayout(snap_page)
+        snap_layout.setContentsMargins(0, 0, 0, 0)
+        snap_layout.setSpacing(8)
+
+        snap_header = QHBoxLayout()
+        snap_header.addWidget(QLabel("<b>📋 快照列表</b>"))
+        snap_header.addStretch()
         self.btn_refresh = QPushButton("🔄")
         self.btn_refresh.setToolTip("刷新列表")
         self.btn_refresh.setFixedWidth(36)
-        left_header.addWidget(self.btn_refresh)
-        left_layout.addLayout(left_header)
+        snap_header.addWidget(self.btn_refresh)
+        snap_layout.addLayout(snap_header)
 
         self.snapshot_list = QListWidget()
         self.snapshot_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        left_layout.addWidget(self.snapshot_list, 1)
+        snap_layout.addWidget(self.snapshot_list, 1)
+
+        self.list_stack.addWidget(snap_page)
+
+        # 页面2：操作记录
+        log_page = QWidget()
+        log_layout = QVBoxLayout(log_page)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        log_layout.setSpacing(8)
+
+        log_header = QHBoxLayout()
+        log_header.addWidget(QLabel("<b>⏱️ 操作记录</b>"))
+        log_header.addStretch()
+        self.btn_log_refresh = QPushButton("🔄")
+        self.btn_log_refresh.setToolTip("刷新记录")
+        self.btn_log_refresh.setFixedWidth(36)
+        log_header.addWidget(self.btn_log_refresh)
+        log_layout.addLayout(log_header)
+
+        self.log_list = QListWidget()
+        self.log_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        log_layout.addWidget(self.log_list, 1)
+
+        log_footer = QLabel("显示最近 100 条操作记录")
+        log_footer.setStyleSheet("color: #94a3b8; font-size: 8pt; padding: 4px 8px;")
+        log_layout.addWidget(log_footer)
+
+        self.list_stack.addWidget(log_page)
+
+        left_layout.addWidget(self.list_stack, 1)
 
         splitter.addWidget(left)
 
@@ -382,8 +503,16 @@ class BackupPage(QWidget):
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(8)
 
-        detail_title = QLabel("<b>📄 快照详情</b>")
-        right_layout.addWidget(detail_title)
+        self.right_title = QLabel("<b>📄 快照详情</b>")
+        right_layout.addWidget(self.right_title)
+
+        self.detail_stack = QStackedWidget()
+
+        # --- 页1：快照详情
+        snap_detail_page = QFrame()
+        snap_d_layout = QVBoxLayout(snap_detail_page)
+        snap_d_layout.setContentsMargins(0, 0, 0, 0)
+        snap_d_layout.setSpacing(0)
 
         self.detail_card = QFrame()
         self.detail_card.setObjectName("Card")
@@ -436,7 +565,61 @@ class BackupPage(QWidget):
         btn_row.addWidget(self.btn_rollback)
         d_layout.addLayout(btn_row)
 
-        right_layout.addWidget(self.detail_card, 1)
+        snap_d_layout.addWidget(self.detail_card)
+        self.detail_stack.addWidget(snap_detail_page)
+
+        # --- 页2：操作记录详情
+        log_detail_page = QFrame()
+        log_d_layout = QVBoxLayout(log_detail_page)
+        log_d_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.log_detail_card = QFrame()
+        self.log_detail_card.setObjectName("Card")
+        ld_layout = QVBoxLayout(self.log_detail_card)
+        ld_layout.setContentsMargins(15, 12, 15, 12)
+        ld_layout.setSpacing(10)
+
+        self.log_detail_type = QLabel("请选择左侧的操作记录查看详情")
+        self.log_detail_type.setStyleSheet("font-size: 12pt; font-weight: bold; color: #1e293b;")
+        ld_layout.addWidget(self.log_detail_type)
+
+        self.log_detail_time = QLabel("")
+        self.log_detail_time.setStyleSheet("color: #64748b;")
+        ld_layout.addWidget(self.log_detail_time)
+
+        self.log_detail_action = QLabel("")
+        self.log_detail_action.setWordWrap(True)
+        self.log_detail_action.setStyleSheet("color: #334155; padding: 6px 0;")
+        ld_layout.addWidget(self.log_detail_action)
+
+        log_info_grid = QHBoxLayout()
+        self.log_detail_count = QLabel("项目数：-")
+        self.log_detail_count.setStyleSheet("padding: 8px 12px; background: #eff6ff; border-radius: 6px; color: #1e40af;")
+        self.log_detail_id = QLabel("")
+        self.log_detail_id.setStyleSheet("padding: 8px 12px; background: #f8fafc; border-radius: 6px; color: #64748b; font-size: 9pt;")
+        self.log_detail_id.setWordWrap(True)
+        log_info_grid.addWidget(self.log_detail_count, 1)
+        log_info_grid.addWidget(self.log_detail_id, 2)
+        ld_layout.addLayout(log_info_grid)
+
+        ld_layout.addWidget(QLabel("<b>操作详情</b>"))
+        self.log_detail_text = QTextEdit()
+        self.log_detail_text.setReadOnly(True)
+        self.log_detail_text.setStyleSheet("font-size: 10pt;")
+        ld_layout.addWidget(self.log_detail_text, 1)
+
+        log_btn_row = QHBoxLayout()
+        self.btn_log_jump_snapshot = QPushButton("📌 跳到对应快照")
+        self.btn_log_jump_snapshot.setObjectName("PrimaryButton")
+        self.btn_log_jump_snapshot.setEnabled(False)
+        log_btn_row.addStretch()
+        log_btn_row.addWidget(self.btn_log_jump_snapshot)
+        ld_layout.addLayout(log_btn_row)
+
+        log_d_layout.addWidget(self.log_detail_card)
+        self.detail_stack.addWidget(log_detail_page)
+
+        right_layout.addWidget(self.detail_stack, 1)
 
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 1)
@@ -451,11 +634,15 @@ class BackupPage(QWidget):
         self.btn_import.clicked.connect(self._import_backup)
         self.btn_clean.clicked.connect(self._clean_old)
         self.btn_refresh.clicked.connect(self._refresh_snapshots)
+        self.btn_log_refresh.clicked.connect(self._refresh_logs)
         self.btn_rollback.clicked.connect(self._do_rollback)
         self.btn_delete.clicked.connect(self._delete_current)
         self.btn_export_snap.clicked.connect(self._export_current)
         self.snapshot_list.currentItemChanged.connect(self._on_select_snapshot)
         self.snapshot_list.customContextMenuRequested.connect(self._show_context_menu)
+        self.log_list.currentItemChanged.connect(self._on_select_log)
+        self.btn_tab_snapshots.clicked.connect(lambda: self._switch_tab(0))
+        self.btn_tab_logs.clicked.connect(lambda: self._switch_tab(1))
 
     def _open_compare_dialog(self):
         if not self._all_snapshots or len(self._all_snapshots) < 2:
@@ -472,14 +659,16 @@ class BackupPage(QWidget):
         """接收对比对话框的部分回滚请求，把 diff 应用到 current_items。
         规则：
           added    → 从当前数据中删除该项目（匹配 name）
-          removed  → 把旧版本项目恢复到当前数据
-          modified → 把当前该项目的数值/信息还原为旧版本
+          removed  → 把旧版本项目完整恢复到当前数据
+          modified → 仅还原价格字段（原价/会员价/医生费/耗材费/成本价），
+                     不动分类、展示名、核算名、备注、品牌等信息字段
         """
         if not self.current_items:
             QMessageBox.warning(self, "提示", "当前没有任何项目数据，无法应用部分回滚")
             return
         current_by_name = {it.name: it for it in self.current_items if it.name}
         applied = 0
+        price_fields = [f for f, _ in COMPARE_PRICE_FIELDS]
 
         for d in diffs:
             t = d["type"]
@@ -501,9 +690,7 @@ class BackupPage(QWidget):
                 old_it = d["old_item"]
                 target = current_by_name.get(old_it.name)
                 if target is not None:
-                    for field in ["original_price", "member_price", "doctor_fee",
-                                  "material_fee", "cost_price", "category",
-                                  "display_name", "internal_name", "remark"]:
+                    for field in price_fields:
                         if hasattr(target, field) and hasattr(old_it, field):
                             setattr(target, field, getattr(old_it, field))
                     target.update_timestamp()
@@ -534,6 +721,133 @@ class BackupPage(QWidget):
     def set_items(self, items: List[PriceItem]):
         self.current_items = items
         self.stat_current.update_value(str(len(items)))
+
+    def _switch_tab(self, idx: int):
+        """切换左侧 Tab（0=快照列表，1=操作记录）"""
+        self.list_stack.setCurrentIndex(idx)
+        self.detail_stack.setCurrentIndex(idx)
+        if idx == 0:
+            self.right_title.setText("<b>📄 快照详情</b>")
+        else:
+            self.right_title.setText("<b>⏱️ 操作记录详情</b>")
+
+    def _refresh_logs(self):
+        """刷新操作记录列表。"""
+        self.log_list.clear()
+        if self.log_manager is None:
+            return
+        logs = self.log_manager.list_logs(limit=100)
+        for log in logs:
+            item = QListWidgetItem()
+            log_type = log.get("type", "snapshot")
+            type_info = OperationLogManager.LOG_TYPES.get(
+                log_type, {"label": "📝 操作", "color": "#64748b"}
+            )
+            label = type_info.get("label", "操作")
+            action = log.get("action", "")
+            created = log.get("created_at", "")
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(created)
+                time_str = dt.strftime("%m-%d %H:%M")
+            except Exception:
+                time_str = created[:16] if created else ""
+
+            cnt = log.get("item_count", 0)
+            item.setText(f"{label}\n   {action}\n   🕒 {time_str}  |  📦 {cnt}项")
+            item.setData(Qt.UserRole, log.get("id", ""))
+            item.setForeground(QBrush(QColor(type_info.get("color", "#334155"))))
+            self.log_list.addItem(item)
+
+    def _on_select_log(self, current: QListWidgetItem, previous: QListWidgetItem):
+        """选中操作记录时显示详情。"""
+        if not current or self.log_manager is None:
+            return
+        log_id = current.data(Qt.UserRole)
+        log = self.log_manager.get_log(log_id)
+        if not log:
+            return
+
+        log_type = log.get("type", "snapshot")
+        type_info = OperationLogManager.LOG_TYPES.get(
+            log_type, {"label": "📝 操作", "color": "#64748b"}
+        )
+        self.log_detail_type.setText(type_info.get("label", "操作"))
+        self.log_detail_type.setStyleSheet(
+            f"font-size: 12pt; font-weight: bold; color: {type_info.get('color', '#1e293b')};"
+        )
+
+        created = log.get("created_at", "")
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(created)
+            time_str = dt.strftime("%Y年%m月%d日 %H:%M:%S")
+        except Exception:
+            time_str = created or ""
+        self.log_detail_time.setText(f"🕒 操作时间：{time_str}")
+
+        self.log_detail_action.setText(f"📝 {log.get('action', '')}")
+
+        cnt = log.get("item_count", 0)
+        self.log_detail_count.setText(f"📦 项目数：{cnt} 个")
+
+        lid = log.get("id", "")
+        self.log_detail_id.setText(f"ID: {lid[:8]}...{lid[-4:]}")
+
+        # 详情内容
+        detail = log.get("detail", {})
+        lines = []
+        if detail:
+            for k, v in detail.items():
+                k_label = {
+                    "source_file": "源文件",
+                    "added": "新增项目数",
+                    "removed": "删除项目数",
+                    "modified": "修改项目数",
+                    "adjust_type": "调整方式",
+                    "percentage": "调整幅度",
+                    "amount": "调整金额",
+                    "target_field": "目标字段",
+                    "rollback_type": "回滚类型",
+                    "snapshot_name": "快照名称",
+                    "from_snapshot": "来源快照",
+                    "to_snapshot": "目标快照",
+                    "reason": "原因",
+                }.get(k, k)
+                lines.append(f"<b>{k_label}：</b>{v}")
+        else:
+            lines.append("无详细信息")
+        self.log_detail_text.setHtml(
+            "<div style='line-height: 2;'>" + "<br>".join(lines) + "</div>"
+        )
+
+        # 关联快照
+        snap_id = log.get("snapshot_id", "")
+        has_snapshot = bool(snap_id)
+        self.btn_log_jump_snapshot.setEnabled(has_snapshot)
+        self.btn_log_jump_snapshot.setProperty("target_snapshot_id", snap_id)
+        if has_snapshot:
+            self.btn_log_jump_snapshot.clicked.connect(self._jump_to_snapshot_from_log)
+        else:
+            try:
+                self.btn_log_jump_snapshot.clicked.disconnect()
+            except Exception:
+                pass
+
+    def _jump_to_snapshot_from_log(self):
+        """从操作记录跳到对应快照。"""
+        snap_id = self.btn_log_jump_snapshot.property("target_snapshot_id")
+        if not snap_id:
+            return
+        # 切到快照 Tab
+        self._switch_tab(0)
+        self.btn_tab_snapshots.setChecked(True)
+        # 在列表中找到并选中
+        for i in range(self.snapshot_list.count()):
+            item = self.snapshot_list.item(i)
+            if item and item.data(Qt.UserRole) == snap_id:
+                self.snapshot_list.setCurrentRow(i)
+                break
 
     def _refresh_snapshots(self):
         snapshots = self.backup_manager.list_snapshots()

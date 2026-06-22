@@ -328,12 +328,213 @@ class BackupManager:
         return items
 
 
+class MappingTemplateManager:
+    """字段映射模板管理：按门店保存列映射规则，下次自动套用。
+
+    模板数据结构：
+    {
+        "store_name": "朝阳门店",
+        "headers": ["项目名称", "原价", ...],  # 保存时的表头列表（用于匹配度计算）
+        "mapping": {"name": 0, "original_price": 2, ...},  # 字段 -> 列索引
+        "created_at": "2025-01-01T...",
+        "last_used_at": "2025-01-02T...",
+        "use_count": 3
+    }
+    """
+
+    def __init__(self, data_dir: str):
+        self.data_dir = data_dir
+        os.makedirs(self.data_dir, exist_ok=True)
+        self.template_file = os.path.join(self.data_dir, "mapping_templates.json")
+        self.templates: List[Dict[str, Any]] = []
+        self._load()
+
+    def _load(self):
+        if os.path.exists(self.template_file):
+            try:
+                with open(self.template_file, "r", encoding="utf-8") as f:
+                    self.templates = json.load(f)
+            except Exception:
+                self.templates = []
+        else:
+            self.templates = []
+
+    def _save(self):
+        with open(self.template_file, "w", encoding="utf-8") as f:
+            json.dump(self.templates, f, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _header_similarity(headers_a: List[str], headers_b: List[str]) -> float:
+        """计算两个表头列表的相似度（0~1）。
+        用 set 交集 / 并集 的 Jaccard 相似度 + 长度加权。
+        """
+        if not headers_a and not headers_b:
+            return 1.0
+        if not headers_a or not headers_b:
+            return 0.0
+        set_a = {str(h).strip().lower() for h in headers_a}
+        set_b = {str(h).strip().lower() for h in headers_b}
+        intersection = len(set_a & set_b)
+        union = len(set_a | set_b)
+        if union == 0:
+            return 0.0
+        return intersection / union
+
+    def find_best_match(self, headers: List[str]) -> Tuple[Optional[Dict[str, Any]], float]:
+        """找到与当前表头最匹配的模板，返回 (模板, 相似度)。"""
+        best_template = None
+        best_score = 0.0
+        for tpl in self.templates:
+            score = self._header_similarity(headers, tpl.get("headers", []))
+            if score > best_score:
+                best_score = score
+                best_template = tpl
+        return best_template, best_score
+
+    def list_templates(self) -> List[Dict[str, Any]]:
+        """列出所有模板（按最后使用时间倒序）。"""
+        return sorted(
+            self.templates,
+            key=lambda t: t.get("last_used_at", ""),
+            reverse=True
+        )
+
+    def save_template(self, store_name: str, headers: List[str],
+                      mapping: Dict[str, int]) -> Dict[str, Any]:
+        """保存或更新模板。如果同名则覆盖。"""
+        now = datetime.now().isoformat()
+        existing_idx = next(
+            (i for i, t in enumerate(self.templates)
+             if t.get("store_name", "").strip() == store_name.strip()),
+            -1
+        )
+        tpl = {
+            "store_name": store_name.strip(),
+            "headers": list(headers),
+            "mapping": dict(mapping),
+            "created_at": now,
+            "last_used_at": now,
+            "use_count": 1,
+        }
+        if existing_idx >= 0:
+            tpl["created_at"] = self.templates[existing_idx].get("created_at", now)
+            tpl["use_count"] = self.templates[existing_idx].get("use_count", 0) + 1
+            self.templates[existing_idx] = tpl
+        else:
+            self.templates.append(tpl)
+        self._save()
+        return tpl
+
+    def touch_template(self, store_name: str):
+        """标记模板为已使用（更新最后使用时间和次数）。"""
+        for tpl in self.templates:
+            if tpl.get("store_name", "") == store_name:
+                tpl["last_used_at"] = datetime.now().isoformat()
+                tpl["use_count"] = tpl.get("use_count", 0) + 1
+                self._save()
+                break
+
+    def delete_template(self, store_name: str) -> bool:
+        before = len(self.templates)
+        self.templates = [t for t in self.templates if t.get("store_name", "") != store_name]
+        if len(self.templates) != before:
+            self._save()
+            return True
+        return False
+
+
+class OperationLogManager:
+    """操作记录时间线管理器：记录导入、保存、批量调价、部分回滚等操作。
+
+    每条日志结构：
+    {
+        "id": "uuid",
+        "type": "import" | "save" | "batch_adjust" | "partial_rollback" | "full_rollback" | "snapshot",
+        "action": "导入价目表",        // 人类可读操作名
+        "created_at": "2025-01-01T12:00:00",
+        "item_count": 120,              // 操作后项目数
+        "snapshot_id": "xxx",           // 关联的快照 ID（可选）
+        "detail": {                     // 操作详情，不同类型字段不同
+            "source_file": "朝阳门店.xlsx",
+            "added": 5, "removed": 3, "modified": 10,
+            "adjust_type": "percentage", "percentage": 10.0,
+            ...
+        }
+    }
+    """
+
+    LOG_TYPES = {
+        "import": {"label": "📥 导入", "color": "#3b82f6"},
+        "save": {"label": "💾 保存", "color": "#10b981"},
+        "batch_adjust": {"label": "⚡ 批量调价", "color": "#f59e0b"},
+        "partial_rollback": {"label": "↩️ 部分回滚", "color": "#8b5cf6"},
+        "full_rollback": {"label": "⏪ 整份回滚", "color": "#ef4444"},
+        "snapshot": {"label": "📸 创建快照", "color": "#0ea5e9"},
+    }
+
+    def __init__(self, data_dir: str):
+        self.data_dir = data_dir
+        os.makedirs(self.data_dir, exist_ok=True)
+        self.log_file = os.path.join(self.data_dir, "operation_logs.json")
+        self.logs: List[Dict[str, Any]] = []
+        self._load()
+
+    def _load(self):
+        if os.path.exists(self.log_file):
+            try:
+                with open(self.log_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.logs = data if isinstance(data, list) else []
+            except Exception:
+                self.logs = []
+        else:
+            self.logs = []
+
+    def _save(self):
+        with open(self.log_file, "w", encoding="utf-8") as f:
+            json.dump(self.logs, f, ensure_ascii=False, indent=2)
+
+    def list_logs(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """列出所有日志（按时间倒序）。"""
+        sorted_logs = sorted(self.logs, key=lambda x: x.get("created_at", ""), reverse=True)
+        return sorted_logs[:limit]
+
+    def add_log(self, log_type: str, action: str, item_count: int = 0,
+                snapshot_id: str = "", detail: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """添加一条操作日志。"""
+        import uuid
+        log = {
+            "id": str(uuid.uuid4()),
+            "type": log_type,
+            "action": action,
+            "created_at": datetime.now().isoformat(),
+            "item_count": item_count,
+            "snapshot_id": snapshot_id,
+            "detail": detail or {},
+        }
+        self.logs.insert(0, log)
+        # 最多保留 500 条
+        if len(self.logs) > 500:
+            self.logs = self.logs[:500]
+        self._save()
+        return log
+
+    def get_log(self, log_id: str) -> Optional[Dict[str, Any]]:
+        return next((l for l in self.logs if l.get("id") == log_id), None)
+
+    def clear(self):
+        self.logs = []
+        self._save()
+
+
 class DataStore:
     def __init__(self, data_dir: str, backup_dir: str):
         self.data_dir = data_dir
         os.makedirs(self.data_dir, exist_ok=True)
         self.data_file = os.path.join(self.data_dir, "current_items.json")
         self.backup_manager = BackupManager(backup_dir)
+        self.mapping_template_manager = MappingTemplateManager(data_dir)
+        self.operation_log_manager = OperationLogManager(data_dir)
         self.items: List[PriceItem] = []
         self.load()
 

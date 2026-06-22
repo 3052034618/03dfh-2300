@@ -164,11 +164,14 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(topbar)
 
         self.stack = QStackedWidget()
-        self.import_page = ImportPage()
+        self.import_page = ImportPage(template_manager=self.data_store.mapping_template_manager)
         self.validation_page = ValidationPage()
         self.batch_page = BatchAdjustPage()
         self.print_page = PrintPage()
-        self.backup_page = BackupPage(backup_dir=self.data_store.backup_manager.backup_dir)
+        self.backup_page = BackupPage(
+            backup_dir=self.data_store.backup_manager.backup_dir,
+            log_manager=self.data_store.operation_log_manager
+        )
 
         self.stack.addWidget(self.import_page)
         self.stack.addWidget(self.validation_page)
@@ -194,7 +197,7 @@ class MainWindow(QMainWindow):
         self.validation_page.saveRequested.connect(self._save_all)
         self.batch_page.itemsUpdated.connect(self._on_items_updated)
         self.backup_page.rollbackRequested.connect(self._on_rollback)
-        self.backup_page.partialRollbackRequested.connect(self._on_rollback)
+        self.backup_page.partialRollbackRequested.connect(self._on_partial_rollback)
 
         self.btn_save_all.clicked.connect(self._save_all)
         self.btn_export_sample.clicked.connect(self._export_sample_template)
@@ -222,6 +225,7 @@ class MainWindow(QMainWindow):
         can_save, errors = PriceValidator.can_save(items)
         has_issues = len(errors) > 0
 
+        snapshot_id = ""
         if has_issues:
             cost_count = sum(1 for e in errors if "低于成本价" in e)
             member_count = sum(1 for e in errors if "会员价" in e)
@@ -242,8 +246,24 @@ class MainWindow(QMainWindow):
             )
             if ok:
                 self._has_unsaved_changes = False
+                snaps = self.data_store.backup_manager.list_snapshots()
+                if snaps:
+                    snapshot_id = snaps[0].get("id", "")
                 QMessageBox.information(self, "导入成功",
                                        f"已导入并保存 {len(items)} 个项目。\n可前往「价格校验」页面查看。")
+
+        # 记录操作日志
+        self.data_store.operation_log_manager.add_log(
+            log_type="import",
+            action=f"导入价目表（{len(items)} 项）",
+            item_count=len(items),
+            snapshot_id=snapshot_id,
+            detail={
+                "项目总数": len(items),
+                "问题数量": len(errors),
+                "是否保存": "否（待校验修复）" if has_issues else "是（已自动保存）",
+            }
+        )
 
         self._update_save_status(has_issues)
 
@@ -291,6 +311,47 @@ class MainWindow(QMainWindow):
             pass
         self._update_save_status(False)
         self.statusBar().showMessage(f"已回滚到 {len(items)} 个项目", 3000)
+        # 记录整份回滚日志
+        snaps = self.data_store.backup_manager.list_snapshots()
+        snapshot_id = snaps[0].get("id", "") if snaps else ""
+        self.data_store.operation_log_manager.add_log(
+            log_type="full_rollback",
+            action=f"整份回滚（{len(items)} 项）",
+            item_count=len(items),
+            snapshot_id=snapshot_id,
+            detail={
+                "项目总数": len(items),
+                "回滚类型": "整份回滚",
+            }
+        )
+
+        for page_idx in [1, 2, 3]:
+            if page_idx == self.stack.currentIndex():
+                self._switch_page(page_idx)
+
+    def _on_partial_rollback(self, items: List[PriceItem]):
+        """部分回滚的处理：同步数据、保存、记录部分回滚日志。"""
+        self.data_store.set_items(items)
+        try:
+            self.data_store._save_data_only()
+            self._has_unsaved_changes = False
+        except Exception:
+            pass
+        self._update_save_status(False)
+        self.statusBar().showMessage(f"部分回滚完成，共 {len(items)} 个项目", 3000)
+        # 记录部分回滚日志
+        snaps = self.data_store.backup_manager.list_snapshots()
+        snapshot_id = snaps[0].get("id", "") if snaps else ""
+        self.data_store.operation_log_manager.add_log(
+            log_type="partial_rollback",
+            action=f"部分回滚（{len(items)} 项）",
+            item_count=len(items),
+            snapshot_id=snapshot_id,
+            detail={
+                "项目总数": len(items),
+                "回滚类型": "部分回滚（仅价格字段）",
+            }
+        )
 
         for page_idx in [1, 2, 3]:
             if page_idx == self.stack.currentIndex():
@@ -311,6 +372,20 @@ class MainWindow(QMainWindow):
             self._has_unsaved_changes = False
             self._update_save_status(False)
             self._update_original_snapshots()
+            # 取最新快照 ID
+            snaps = self.data_store.backup_manager.list_snapshots()
+            snapshot_id = snaps[0].get("id", "") if snaps else ""
+            # 记录操作日志
+            self.data_store.operation_log_manager.add_log(
+                log_type="save",
+                action=f"保存全部修改（{len(self.data_store.items)} 项）",
+                item_count=len(self.data_store.items),
+                snapshot_id=snapshot_id,
+                detail={
+                    "项目总数": len(self.data_store.items),
+                    "快照名称": f"手动保存_{len(self.data_store.items)}项",
+                }
+            )
             QMessageBox.information(self, "保存成功",
                                     f"已保存 {len(self.data_store.items)} 个项目\n"
                                     f"并创建了对应快照备份。")
